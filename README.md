@@ -121,7 +121,7 @@ as gaps. The application does not fill them with sample data.
 Report release requires a current complete Parquet build, clinical review for
 every selected drug, a different Admin from the report builder, and at least
 two active Admin accounts. The product does not provide plan-specific claims
-analysis, payer-file analysis, or multi-organization workspaces.
+analysis, payer-file analysis, or multi-organization workspaces..
 
 ## Verification
 
