@@ -63,16 +63,53 @@ class AuditEventAdmin(admin.ModelAdmin):
     readonly_fields = ("actor", "action", "entity_type", "entity_id", "details", "created_at")
 
 from .models import (
-    AuditReview, ClaimsSummaryImport, ClaimsSummaryRecord, NetworkRosterEntry,
+    AuditReview, ClaimsExplorerDataset, ClaimsSummaryImport, ClaimsSummaryRecord, NetworkRosterEntry,
     Plan, PlanAudit, PlanAuditResult, PlanOrganization, SavingsOpportunity,
 )
 
 for model in (
     PlanOrganization, Plan, ClaimsSummaryImport, ClaimsSummaryRecord,
-    NetworkRosterEntry, PlanAudit, PlanAuditResult, SavingsOpportunity, AuditReview,
+    NetworkRosterEntry, PlanAudit, PlanAuditResult, SavingsOpportunity,
 ):
     admin.site.register(model)
 
 from .models import PlanOrganizationAccess
 
 admin.site.register(PlanOrganizationAccess)
+
+
+@admin.register(ClaimsExplorerDataset)
+class ClaimsExplorerDatasetAdmin(admin.ModelAdmin):
+    list_display = ("organization", "dataset_identifier", "registered_by", "registered_at")
+    list_filter = ("dataset_identifier",)
+    readonly_fields = ("registered_by", "registered_at")
+
+    def save_model(self, request, obj, form, change):
+        if not change and not obj.registered_by_id:
+            obj.registered_by = request.user
+        super().save_model(request, obj, form, change)
+
+
+@admin.register(AuditReview)
+class AuditReviewAdmin(admin.ModelAdmin):
+    list_display = ("plan_audit", "reviewer", "review_status", "reviewed_at")
+    list_filter = ("review_status",)
+    readonly_fields = ("plan_audit", "reviewer", "review_status", "comments", "reviewed_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+from .models import BrokerEvaluation
+
+
+@admin.register(BrokerEvaluation)
+class BrokerEvaluationAdmin(admin.ModelAdmin):
+    list_display = ("organization_name", "status", "evaluation_date", "pilot_interest", "recorded_by", "created_at")
+    list_filter = ("status", "pilot_interest")
+    search_fields = ("organization_name", "contact_reference", "feedback")
+    readonly_fields = ("created_at", "updated_at")
+

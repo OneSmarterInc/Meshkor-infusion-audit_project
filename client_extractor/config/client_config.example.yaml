@@ -4,6 +4,11 @@
 plan_id: ""
 plan_reference: ""
 schema_version: "1.0"
+# Map canonical input fields to customer source headers when the names differ.
+# Identifiers should be text in spreadsheets to preserve leading zeroes.
+# column_mapping:
+#   claim_id: Claim Number
+#   member_id: Member Number
 # Add only manually verified HCPCS billing units.
 # Each entry needs qty, unit, verification_status: validated, source_reference, and source_sha256.
 hcpcs_billing_units: {}

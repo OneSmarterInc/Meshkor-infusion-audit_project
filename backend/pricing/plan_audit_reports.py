@@ -1,6 +1,7 @@
 """Savings, quality, review, and report endpoints."""
 import csv
 import io
+import json
 from collections import Counter
 
 from django.http import HttpResponse
@@ -63,18 +64,30 @@ def audit_network_validation(request, audit_id):
 @permission_classes([CanView])
 def audit_quality(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
-    statuses = Counter(audit.results.values_list("data_quality_status", flat=True))
+    results = audit.results.all()
+    statuses = Counter(results.values_list("data_quality_status", flat=True))
+    result_count = results.count()
+    asp_count = results.filter(asp_payment_limit__isnull=False).count()
+    hospital_count = results.filter(hospital_price_per_unit__isnull=False).count()
     return Response({
         "audit_id": audit.pk, "status": audit.status,
         "import_quality": audit.summary_import.validation_summary,
         "result_status_counts": dict(statuses),
+        "benchmark_availability": {
+            "result_rows": result_count,
+            "asp_available": asp_count,
+            "asp_unavailable": result_count - asp_count,
+            "hospital_reference_available": hospital_count,
+            "hospital_reference_unavailable": result_count - hospital_count,
+        },
         "notes": [
             "Only approved, unsuppressed aggregate rows are included.",
             "Hospital price references require a verified site mapping and an unambiguous matching quarter and setting.",
             "Network status is unknown unless the plan roster covers the entire claim quarter.",
             "Potential savings remain pending clinical review; no savings are treated as guaranteed.",
             "Summary metrics include only visible approved aggregate rows.",
-        ],
+        ] + (["Potential savings are unavailable because no evidence-backed lower-priced full-quarter in-network alternative was identified."]
+             if not audit.savings_opportunities.exists() else []),
     })
 
 
@@ -125,8 +138,11 @@ def plan_report(request, audit_id):
     metrics = _visible_totals(audit)
     draw(f"Visible units: {metrics['units_analyzed']} | Visible allowed: {metrics['visible_allowed_amount']} "
          f"| Visible paid: {metrics['visible_paid_amount']}")
-    draw(f"Potential allowed savings: {metrics['potential_allowed_savings']} "
-         "(requires clinical review; not guaranteed)", size=8)
+    savings_text = metrics["potential_allowed_savings"]
+    savings_label = (f"Potential allowed savings: {savings_text} (requires clinical review; not guaranteed)"
+                     if savings_text is not None else
+                     "Potential allowed savings: unavailable (no evidence-backed lower-priced full-quarter in-network alternative)")
+    draw(savings_label, size=8)
     draw("HCPCS | NPI | Quarter | Allowed/unit | Paid/unit | Hospital/unit | ASP | Hospital x | Allowed x | Paid x | Quality",
          bold=True)
     for row in audit.results.all()[:5000]:
@@ -158,7 +174,7 @@ def export_plan_csv(request, audit_id):
         "plan_allowed_price_per_unit", "plan_paid_price_per_unit",
         "hospital_price_per_unit", "asp_payment_limit", "hospital_markup_multiple", "allowed_markup_multiple",
         "paid_markup_multiple", "plan_to_hospital_price_multiple",
-        "network_status", "data_quality_status", "data_quality_notes",
+        "network_status", "data_quality_status", "data_quality_notes", "source_references",
     ]
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
@@ -180,6 +196,7 @@ def export_plan_csv(request, audit_id):
             "plan_to_hospital_price_multiple": _decimal_text(row.plan_to_hospital_price_multiple),
             "network_status": row.network_status, "data_quality_status": row.data_quality_status,
             "data_quality_notes": "; ".join(row.data_quality_notes),
+            "source_references": json.dumps(row.source_references, sort_keys=True, separators=(",", ":")),
         }
         writer.writerow({key: csv_safe_cell(value) for key, value in data.items()})
     response = HttpResponse("\ufeff" + output.getvalue(), content_type="text/csv; charset=utf-8")
@@ -204,9 +221,9 @@ def audit_review(request, audit_id):
     comments = str(request.data.get("comments", "")).strip()
     if len(comments) > 2000:
         return Response({"error": "Review comments are limited to 2,000 characters."}, status=400)
-    review, _ = AuditReview.objects.update_or_create(
+    review = AuditReview.objects.create(
         plan_audit=audit, reviewer=request.user,
-        defaults={"review_status": "submitted", "comments": comments},
+        review_status="submitted", comments=comments,
     )
     AuditEvent.objects.create(actor=request.user, action="plan_audit_review_submitted",
                               entity_type="plan_audit", entity_id=str(audit.pk))
@@ -225,9 +242,8 @@ def _set_review(request, audit_id, status):
         return Response({"error": "Provide a review reason when rejecting an audit."}, status=400)
     if len(comments) > 2000:
         return Response({"error": "Review comments are limited to 2,000 characters."}, status=400)
-    review, _ = AuditReview.objects.update_or_create(
-        plan_audit=audit, reviewer=request.user,
-        defaults={"review_status": status, "comments": comments},
+    review = AuditReview.objects.create(
+        plan_audit=audit, reviewer=request.user, review_status=status, comments=comments,
     )
     audit.status = "completed" if status == "approved" else "needs_review"
     audit.save(update_fields=["status"])

@@ -28,7 +28,11 @@ def files() -> dict[str, Path]:
         "comparison": stored(p["mart"], "mart", "comparison.parquet"),
         "run_info": stored(p["mart"], "mart", "run_info.json"),
         "asp": stored(p["ref"], "ref", "ref_asp.parquet"),
-        "crosswalk": stored(p["ref"], "ref", "ref_ndc_hcpcs.parquet"),
+        "crosswalk": (
+            stored(p["ref"], "ref", "ref_crosswalk.parquet")
+            if (p["ref"] / "ref_crosswalk.parquet").is_file()
+            else stored(p["ref"], "ref", "ref_ndc_hcpcs.parquet")
+        ),
         "ndc_products": stored(p["ref"], "ref", "ref_ndc_product.parquet"),
         "ndc_packages": stored(p["ref"], "ref", "ref_ndc_package.parquet"),
         "hospitals_ref": stored(p["ref"], "ref", "ref_hospitals.parquet"),
@@ -47,13 +51,44 @@ def _path(name: str) -> str:
     return f.as_posix()
 
 
+# Columns written by older load_asp.py versions.
+_ASP_OLD_TO_NEW = {
+    "period": "quarter",
+    "dosage": "dosage_text",
+    "description": "short_description",
+}
+
+
+def _asp_read_expr(path: str) -> str:
+    """Return a Parquet expression with legacy ASP columns aliased canonically."""
+    con = duckdb.connect()
+    try:
+        cols = {row[0] for row in con.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?)", [path]).fetchall()}
+    finally:
+        con.close()
+
+    old_cols = set(_ASP_OLD_TO_NEW) & cols
+    aliases = ", ".join(
+        f'"{old}" AS "{new}"'
+        for old, new in _ASP_OLD_TO_NEW.items()
+        if old in old_cols and new not in cols
+    )
+    escaped_path = path.replace("'", "''")
+    source = f"read_parquet('{escaped_path}')"
+    return f"(SELECT *, {aliases} FROM {source})" if aliases else source
+
+
 def query(sql: str, params: list | None = None, **tables: str) -> list[dict]:
-    """Run SQL where {cmp}, {asp}, {quality} are replaced by read_parquet(...)."""
+    """Run SQL with Parquet table expressions; normalize legacy ASP columns."""
     if "comparison" in tables.values():
         require_current_scope()
     con = duckdb.connect()
     try:
-        sub = {k: f"read_parquet('{_path(v)}')" for k, v in tables.items()}
+        sub = {}
+        for key, value in tables.items():
+            path = _path(value)
+            sub[key] = _asp_read_expr(path) if value == "asp" else f"read_parquet('{path}')"
         cur = con.execute(sql.format(**sub), params or [])
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]

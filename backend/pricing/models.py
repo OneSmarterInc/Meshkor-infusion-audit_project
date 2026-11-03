@@ -343,9 +343,7 @@ class AuditReview(models.Model):
     reviewed_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["-reviewed_at"]
-        constraints = [models.UniqueConstraint(fields=["plan_audit", "reviewer"],
-                                                name="plan_audit_reviewer_unique")]
+        ordering = ["-reviewed_at", "-pk"]
 
 class PlanOrganizationAccess(models.Model):
     """Explicit organization boundary for Viewer access to client aggregates."""
@@ -359,3 +357,90 @@ class PlanOrganizationAccess(models.Model):
         ordering = ["organization__organization_name", "user__username"]
         constraints = [models.UniqueConstraint(fields=["organization", "user"],
                                                 name="plan_org_user_access_unique")]
+
+
+class ClaimsExplorerDataset(models.Model):
+    DATASET_IDENTIFIERS = [
+        ("desynpuf_outpatient_claims_sample_1", "DE-SynPUF outpatient sample 1"),
+        ("desynpuf_inpatient_claims_sample_1", "DE-SynPUF inpatient sample 1"),
+        ("synthea_sample_data", "Synthea Synthetic EHR & Claims Demo"),
+    ]
+    CATEGORIES = [
+        ("desynpuf", "CMS DE-SynPUF Synthetic Claims"),
+        ("synthetic_demo", "Synthea Synthetic EHR & Claims Demo"),
+    ]
+
+    organization = models.ForeignKey(
+        PlanOrganization, on_delete=models.CASCADE, related_name="claims_explorer_datasets"
+    )
+    dataset_identifier = models.CharField(max_length=80, choices=DATASET_IDENTIFIERS)
+    category = models.CharField(max_length=40, choices=CATEGORIES, default="desynpuf")
+    registered_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="claims_explorer_datasets_registered",
+    )
+    registered_at = models.DateTimeField(auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        if self.dataset_identifier == "synthea_sample_data":
+            self.category = "synthetic_demo"
+        elif not self.category:
+            self.category = "desynpuf"
+        super().save(*args, **kwargs)
+
+    class Meta:
+        ordering = ["dataset_identifier"]
+        constraints = [models.UniqueConstraint(
+            fields=["organization", "dataset_identifier"],
+            name="claims_explorer_org_dataset_unique",
+        )]
+
+
+class BrokerEvaluation(models.Model):
+    """Evaluation record for Phase 1 market report by a genuine broker or TPA.
+
+    Commercial prerequisite for Phase 4: Must document 3 genuine evaluations
+    with attributable feedback or evidence before commercial pilot launch.
+    """
+    STATUS_CHOICES = [
+        ("not_contacted", "Not contacted"),
+        ("contacted", "Contacted"),
+        ("meeting_scheduled", "Meeting scheduled"),
+        ("report_evaluated", "Report evaluated"),
+        ("feedback_received", "Feedback received"),
+        ("pilot_interested", "Pilot interested"),
+        ("not_interested", "Not interested"),
+    ]
+    VERIFIED_STATUSES = frozenset(["report_evaluated", "feedback_received", "pilot_interested"])
+
+    organization_name = models.CharField(max_length=200, db_index=True)
+    contact_reference = models.CharField(max_length=200, blank=True)
+    report_version = models.CharField(max_length=120, blank=True)
+    evaluation_date = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default="not_contacted", db_index=True)
+    feedback = models.TextField(blank=True)
+    pilot_interest = models.BooleanField(default=False)
+    next_action = models.CharField(max_length=500, blank=True)
+    evidence_reference = models.TextField(blank=True)
+    recorded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="broker_evaluations"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def is_verified_evaluation(self) -> bool:
+        """A record counts toward the 3-evaluation requirement only when there is genuine
+
+        evaluation, attributable feedback or equivalent documented evidence.
+        Scheduling a meeting or contacting does not count.
+        """
+        return (
+            self.status in self.VERIFIED_STATUSES
+            and self.evaluation_date is not None
+            and bool((self.feedback or "").strip() or (self.evidence_reference or "").strip())
+        )
+

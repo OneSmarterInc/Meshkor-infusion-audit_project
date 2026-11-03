@@ -1,6 +1,6 @@
 from collections import defaultdict
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 
 def quarter_for(service_date: date) -> str:
@@ -8,6 +8,15 @@ def quarter_for(service_date: date) -> str:
 
 
 def aggregate_claims(claims, *, plan_reference, source_period, extracted_at, billing_units):
+    with localcontext() as context:
+        context.prec = 50
+        return _aggregate_claims(
+            claims, plan_reference=plan_reference, source_period=source_period,
+            extracted_at=extracted_at, billing_units=billing_units,
+        )
+
+
+def _aggregate_claims(claims, *, plan_reference, source_period, extracted_at, billing_units):
     groups = defaultdict(lambda: {"units": Decimal(0), "allowed": Decimal(0),
                                   "paid": Decimal(0), "members": set()})
     quality = {"reasons": {}, "excluded_records": 0}
@@ -29,6 +38,9 @@ def aggregate_claims(claims, *, plan_reference, source_period, extracted_at, bil
         if len(values["members"]) < 11:
             suppressed.add((key[0], key[1], key[3], key[4]))
             _reason(quality, "small_cell_suppressed")
+            continue
+        if not all(_fits_import_decimal(values[field]) for field in ("units", "allowed", "paid")):
+            _reason(quality, "aggregate_exceeds_import_precision")
             continue
         band = "11-50" if len(values["members"]) <= 50 else "51-100" if len(values["members"]) <= 100 else "100+"
         row = {
@@ -67,3 +79,10 @@ def aggregate_claims(claims, *, plan_reference, source_period, extracted_at, bil
 def _reason(quality, reason):
     quality["reasons"][reason] = quality["reasons"].get(reason, 0) + 1
     quality["excluded_records"] += 1
+
+
+def _fits_import_decimal(value):
+    normalized = value.normalize()
+    scale = max(-normalized.as_tuple().exponent, 0)
+    integer_digits = max(normalized.adjusted() + 1, 0) if value else 1
+    return scale <= 6 and integer_digits <= 18

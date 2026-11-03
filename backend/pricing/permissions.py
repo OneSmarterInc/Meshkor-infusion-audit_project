@@ -48,7 +48,9 @@ class CanView(BasePermission):
 
     def has_permission(self, request, view):
         allowed = has_any_role(request.user, set(APPLICATION_ROLES) | {ADMIN_GROUP, VIEWER_GROUP})
-        if allowed and not request.user.is_superuser and has_any_role(request.user, {CLIENT_GROUP, VIEWER_GROUP}):
+        if (allowed and not request.user.is_superuser
+                and has_any_role(request.user, {CLIENT_GROUP, VIEWER_GROUP})
+                and not has_any_role(request.user, {SUPER_ADMIN_GROUP, ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP})):
             path = request.path.rstrip("/") + "/"
             client_routes = ("/organizations/", "/plans/", "/plan-audits/")
             allowed = request.method == "GET" and any(route in path for route in client_routes)

@@ -145,6 +145,10 @@ function clean(p) {
 export function useApi(path, params, deps = []) {
   const [state, set] = useState({ data: null, error: null, loading: true });
   useEffect(() => {
+    if (!path) {
+      set({ data: null, error: null, loading: false });
+      return;
+    }
     let live = true;
     set((s) => ({ ...s, loading: true }));
     getJSON(path, params)
@@ -216,6 +220,10 @@ export async function uploadNetworkRoster(planId, rosterFile) {
   const form = new FormData();
   form.append("file", rosterFile);
   return uploadForm("plans/" + planId + "/network-roster/", form);
+}
+
+export async function patchJSON(path, body = {}) {
+  return request(path, { method: "PATCH", body: JSON.stringify(body) });
 }
 
 export async function deleteJSON(path) {

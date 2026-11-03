@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import hashlib
 import math
 import re
 import sys
@@ -14,11 +15,14 @@ from .logging.secure_logger import configure_secure_logger
 from .processing.aggregate_claims import aggregate_claims
 from .processing.resolve_adjustments import resolve_claims
 from .readers import read_claims
-from .validation.claims_validator import HCPCS_PATTERN, REQUIRED_FIELDS, validate_claim
+from .validation.claims_validator import (
+    HCPCS_PATTERN, OPTIONAL_FIELDS, REQUIRED_FIELDS, normalize_header, validate_claim,
+)
 
 
 logger = configure_secure_logger()
 CLAIM_LIMIT = 1_000_000
+INPUT_SIZE_LIMIT = 256 * 1024 * 1024
 SCHEMA_VERSION = "1.0"
 
 
@@ -43,6 +47,9 @@ def extract_claims(args):
     except (OSError, yaml.YAMLError) as exc:
         logger.error("The local configuration could not be read: %s", exc)
         return 2
+    if not isinstance(config, dict):
+        logger.error("The local configuration must be a YAML object.")
+        return 2
     plan_id = str(config.get("plan_id", "")).strip()
     plan_reference = str(config.get("plan_reference", "")).strip()
     if (not plan_id or not plan_reference
@@ -52,6 +59,16 @@ def extract_claims(args):
     schema_version = str(config.get("schema_version", SCHEMA_VERSION)).strip()
     if schema_version != SCHEMA_VERSION:
         logger.error("This extractor supports schema_version %s.", SCHEMA_VERSION)
+        return 2
+    column_mapping = config.get("column_mapping") or {}
+    if (not isinstance(column_mapping, dict)
+            or any(field not in REQUIRED_FIELDS | OPTIONAL_FIELDS
+                   or not isinstance(source, str) or not source.strip()
+                   for field, source in column_mapping.items())
+            or len({normalize_header(column_mapping.get(field, field))
+                    for field in REQUIRED_FIELDS | (OPTIONAL_FIELDS & set(column_mapping))})
+            != len(REQUIRED_FIELDS) + len(OPTIONAL_FIELDS & set(column_mapping))):
+        logger.error("column_mapping must map unique source column names to supported canonical fields.")
         return 2
     billing_units = config.get("hcpcs_billing_units") or {}
     if not isinstance(billing_units, dict):
@@ -81,15 +98,24 @@ def extract_claims(args):
         normalized_billing_units[normalized_code] = unit
     billing_units = normalized_billing_units
 
+    try:
+        if not args.claims.is_file() or args.claims.stat().st_size > INPUT_SIZE_LIMIT:
+            raise ValueError("Claims input is missing or exceeds the 256 MiB local safety limit.")
+        source_sha256 = _sha256_file(args.claims)
+    except OSError as exc:
+        logger.error("Claims input could not be inspected: %s", exc)
+        return 2
+
     claims, errors, fingerprints = [], [], set()
     input_count = duplicate_count = invalid_count = 0
     try:
-        for source_row, source in read_claims(args.claims):
+        for source_row, source in read_claims(args.claims, column_mapping):
             input_count += 1
             if input_count > CLAIM_LIMIT:
                 raise ValueError(f"Input exceeds the {CLAIM_LIMIT:,}-record safety limit.")
             try:
-                claim = validate_claim(source, source_row)
+                normalized_source = _map_source_columns(source, column_mapping)
+                claim = validate_claim(normalized_source, source_row)
                 if claim["plan_id"] != plan_id:
                     raise ValueError("plan_id does not match the configured local plan")
                 fingerprint = _record_fingerprint(claim)
@@ -117,7 +143,7 @@ def extract_claims(args):
     for error in errors:
         quality["reasons"][error["category"]] = quality["reasons"].get(error["category"], 0) + 1
     adjudicated = resolve_claims(claims, quality)
-    dates = [claim["service_date"] for claim in adjudicated]
+    dates = [claim["service_date"] for claim in claims]
     source_period = f"{min(dates).isoformat()}/{max(dates).isoformat()}" if dates else ""
     extracted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     summary, privacy_quality = aggregate_claims(
@@ -133,7 +159,16 @@ def extract_claims(args):
     if not summary:
         logger.error("No aggregates passed adjudication, unit, and privacy controls; no summary was exported.")
         return 1
-    destination, manifest, digest = export_summary(summary, args.output)
+    provenance = {
+        "source_sha256": source_sha256,
+        "source_format": args.claims.suffix.casefold().lstrip("."),
+        "input_records": input_count,
+        "source_period": source_period,
+        "plan_reference": plan_reference,
+    }
+    destination, manifest, digest = export_summary(
+        summary, args.output, source_provenance=provenance
+    )
     logger.info("Created %s (%d approved aggregate rows; SHA-256 %s)",
                 destination, len(summary), digest)
     logger.info("Local data-quality report: %s", args.output / "data_quality.json")
@@ -144,6 +179,25 @@ def extract_claims(args):
 def _record_fingerprint(claim):
     fields = sorted(REQUIRED_FIELDS | {"adjustment_reference", "reversal_reference", "service_setting"})
     return tuple(str(claim.get(field, "")) for field in fields)
+
+
+def _map_source_columns(row, column_mapping):
+    if row.get("__extra_columns__"):
+        return row
+    by_normalized_header = {normalize_header(key): value for key, value in row.items()}
+    normalized = {}
+    for field in REQUIRED_FIELDS | OPTIONAL_FIELDS:
+        source_name = column_mapping.get(field, field)
+        normalized[field] = by_normalized_header.get(normalize_header(source_name))
+    return normalized
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _write_quality(output, quality, errors):

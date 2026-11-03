@@ -85,6 +85,13 @@ def main() -> int:
 
     asp = pl.read_parquet(p["ref"] / "ref_asp.parquet").filter(
         pl.col("hcpcs").is_in(list(drugs)))
+    rename_map = {}
+    if "quarter" not in asp.columns and "period" in asp.columns:
+        rename_map["period"] = "quarter"
+    if "dosage_text" not in asp.columns and "dosage" in asp.columns:
+        rename_map["dosage"] = "dosage_text"
+    if rename_map:
+        asp = asp.rename(rename_map)
     quarters = sorted(asp["quarter"].unique().to_list())
     benchmark_rule = cfg.get("benchmark_quarter", "file_date")
     bench = {(r["hcpcs"], r["quarter"]): r for r in asp.iter_rows(named=True)}

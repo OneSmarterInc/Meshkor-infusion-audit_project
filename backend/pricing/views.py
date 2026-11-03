@@ -34,7 +34,7 @@ from django.db import connections
 from . import data
 from .models import AuditEvent, DrugUnitReview, ProcessingJob, ReportRecord, SourceFile
 from .permissions import (ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP, SUPER_ADMIN_GROUP,
-                          CanAdminister, CanAnalyze, CanReview, has_any_role)
+                          CanAdminister, CanAnalyze, CanReview, CanView, has_any_role)
 from pipeline.common import csv_safe_cell
 
 HEADLINE = "price_type = 'negotiated_dollar' AND status = 'ok'"
@@ -647,12 +647,15 @@ def reference_catalog(request):
         except Exception:
             source_files, source_hashes = [], []
         periods = []
-        period_col = next((c for c in ("quarter", "spend_year", "reporting_period") if c in columns), None)
+        period_col = next((c for c in ("quarter", "period", "spend_year", "reporting_period")
+                           if c in columns), None)
         if period_col:
             try:
+                query_period_col = ("quarter" if file_key == "asp" and period_col == "period"
+                                    else period_col)
                 periods = [row["period"] for row in data.query(
-                    f"SELECT DISTINCT {period_col} AS period FROM {{table}} "
-                    f"WHERE {period_col} IS NOT NULL ORDER BY period", table=file_key)]
+                    f"SELECT DISTINCT {query_period_col} AS period FROM {{table}} "
+                    f"WHERE {query_period_col} IS NOT NULL ORDER BY period", table=file_key)]
             except Exception:
                 periods = []
         try:
@@ -698,8 +701,10 @@ def reference_table(request, dataset_name: str):
             params.extend([f"%{search}%"] * len(search_cols))
         for field in ("quarter", "hcpcs", "ccn", "state", "ndc11"):
             value = request.query_params.get(field)
-            if value and field in columns:
-                filters.append(f"CAST({quote_identifier(field)} AS VARCHAR) = ?")
+            source_field = ("period" if dataset_name == "asp" and field == "quarter"
+                            and field not in columns and "period" in columns else field)
+            if value and source_field in columns:
+                filters.append(f"CAST({quote_identifier(source_field)} AS VARCHAR) = ?")
                 params.append(value)
         where = " WHERE " + " AND ".join(filters) if filters else ""
         table_source = "read_parquet(?)"
@@ -1396,3 +1401,262 @@ def report_pdf(request):
     resp = HttpResponse(pdf, content_type="application/pdf")
     resp["Content-Disposition"] = f'attachment; filename="{name}"'
     return resp
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Prerequisite: Broker/TPA Market Report Evaluations & Pilot Readiness
+# ---------------------------------------------------------------------------
+
+def _evaluation_payload(item):
+    return {
+        "id": item.pk,
+        "organization_name": item.organization_name,
+        "contact_reference": item.contact_reference,
+        "report_version": item.report_version,
+        "evaluation_date": item.evaluation_date.isoformat() if item.evaluation_date else None,
+        "status": item.status,
+        "status_display": item.get_status_display(),
+        "feedback": item.feedback,
+        "pilot_interest": item.pilot_interest,
+        "next_action": item.next_action,
+        "evidence_reference": item.evidence_reference,
+        "is_verified": item.is_verified_evaluation(),
+        "recorded_by": (item.recorded_by.get_full_name() or item.recorded_by.get_username()) if item.recorded_by else None,
+        "created_at": item.created_at.isoformat(),
+        "updated_at": item.updated_at.isoformat(),
+    }
+
+
+def _compute_evaluation_milestone():
+    from .models import BrokerEvaluation
+    verified_items = [
+        item for item in BrokerEvaluation.objects.all()
+        if item.is_verified_evaluation()
+    ]
+    distinct_orgs = {
+        item.organization_name.strip().casefold()
+        for item in verified_items
+        if item.organization_name.strip()
+    }
+    verified_count = len(distinct_orgs)
+    required_count = 3
+    remaining_count = max(0, required_count - verified_count)
+    satisfied = verified_count >= required_count
+    return {
+        "required_evaluations": required_count,
+        "required_count": required_count,
+        "verified_evaluations": verified_count,
+        "verified_count": verified_count,
+        "remaining_evaluations": remaining_count,
+        "remaining_count": remaining_count,
+        "prerequisite_satisfied": satisfied,
+        "prerequisite_met": satisfied,
+        "status_label": "Satisfied" if satisfied else "Not satisfied (prerequisite pending)",
+        "verified_organizations": sorted(distinct_orgs),
+        "distinct_organizations_verified": sorted(distinct_orgs),
+    }
+
+
+@api_view(["GET", "POST"])
+@permission_classes([CanView])
+def broker_evaluations(request):
+    """List or record broker/TPA market report evaluations."""
+    if not has_any_role(request.user, {SUPER_ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP, ADMIN_GROUP}):
+        return Response({"error": "Evaluation records are restricted to authorized reviewers and administrators."}, status=403)
+    from .models import BrokerEvaluation
+
+    if request.method == "GET":
+        items = BrokerEvaluation.objects.select_related("recorded_by").all()
+        milestone = _compute_evaluation_milestone()
+        return Response({
+            "milestone": milestone,
+            "evaluations": [_evaluation_payload(item) for item in items],
+        })
+
+    # POST: Admin only
+    if not has_any_role(request.user, {SUPER_ADMIN_GROUP, ADMIN_GROUP}):
+        return Response({"error": "Recording a broker evaluation requires the Admin role."}, status=403)
+
+    org_name = str(request.data.get("organization_name", "")).strip()
+    if not org_name or len(org_name) > 200:
+        return Response({"error": "organization_name is required and limited to 200 characters."}, status=400)
+
+    status_val = str(request.data.get("status", "not_contacted")).strip()
+    valid_statuses = dict(BrokerEvaluation.STATUS_CHOICES)
+    if status_val not in valid_statuses:
+        return Response({"error": f"status must be one of: {', '.join(valid_statuses.keys())}."}, status=400)
+
+    eval_date_raw = request.data.get("evaluation_date")
+    eval_date = None
+    if eval_date_raw:
+        from .plan_audit_common import parse_iso_date
+        try:
+            eval_date = parse_iso_date(eval_date_raw, "evaluation_date", optional=True)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=400)
+
+    item = BrokerEvaluation.objects.create(
+        organization_name=org_name,
+        contact_reference=str(request.data.get("contact_reference", "")).strip()[:200],
+        report_version=str(request.data.get("report_version", "")).strip()[:120],
+        evaluation_date=eval_date,
+        status=status_val,
+        feedback=str(request.data.get("feedback", "")).strip(),
+        pilot_interest=bool(request.data.get("pilot_interest", False)),
+        next_action=str(request.data.get("next_action", "")).strip()[:500],
+        evidence_reference=str(request.data.get("evidence_reference", "")).strip(),
+        recorded_by=request.user,
+    )
+    from .models import AuditEvent
+    AuditEvent.objects.create(
+        actor=request.user,
+        action="broker_evaluation_recorded",
+        entity_type="broker_evaluation",
+        entity_id=str(item.pk),
+        details={
+            "organization_name": item.organization_name,
+            "status": item.status,
+            "is_verified": item.is_verified_evaluation(),
+        },
+    )
+    return Response(_evaluation_payload(item), status=201)
+
+
+@api_view(["GET", "PATCH", "DELETE"])
+@permission_classes([CanView])
+def broker_evaluation_detail(request, evaluation_id):
+    """Retrieve, update, or delete a broker/TPA market report evaluation."""
+    if not has_any_role(request.user, {SUPER_ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP, ADMIN_GROUP}):
+        return Response({"error": "Evaluation records are restricted to authorized reviewers and administrators."}, status=403)
+    from .models import BrokerEvaluation
+    from django.shortcuts import get_object_or_404
+    item = get_object_or_404(BrokerEvaluation.objects.select_related("recorded_by"), pk=evaluation_id)
+
+    if request.method == "GET":
+        return Response(_evaluation_payload(item))
+
+    if not has_any_role(request.user, {SUPER_ADMIN_GROUP, ADMIN_GROUP}):
+        return Response({"error": "Modifying or deleting a broker evaluation requires the Admin role."}, status=403)
+
+    if request.method == "DELETE":
+        item_pk = item.pk
+        org_name = item.organization_name
+        item.delete()
+        from .models import AuditEvent
+        AuditEvent.objects.create(
+            actor=request.user,
+            action="broker_evaluation_deleted",
+            entity_type="broker_evaluation",
+            entity_id=str(item_pk),
+            details={"organization_name": org_name},
+        )
+        return Response(status=204)
+
+    # PATCH
+    if "organization_name" in request.data:
+        name = str(request.data["organization_name"]).strip()
+        if not name or len(name) > 200:
+            return Response({"error": "organization_name is invalid."}, status=400)
+        item.organization_name = name
+    if "contact_reference" in request.data:
+        item.contact_reference = str(request.data["contact_reference"]).strip()[:200]
+    if "report_version" in request.data:
+        item.report_version = str(request.data["report_version"]).strip()[:120]
+    if "status" in request.data:
+        st = str(request.data["status"]).strip()
+        if st not in dict(BrokerEvaluation.STATUS_CHOICES):
+            return Response({"error": "Invalid status."}, status=400)
+        item.status = st
+    if "evaluation_date" in request.data:
+        ed_raw = request.data["evaluation_date"]
+        from .plan_audit_common import parse_iso_date
+        try:
+            item.evaluation_date = parse_iso_date(ed_raw, "evaluation_date", optional=True)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=400)
+    if "feedback" in request.data:
+        item.feedback = str(request.data["feedback"]).strip()
+    if "pilot_interest" in request.data:
+        item.pilot_interest = bool(request.data["pilot_interest"])
+    if "next_action" in request.data:
+        item.next_action = str(request.data["next_action"]).strip()[:500]
+    if "evidence_reference" in request.data:
+        item.evidence_reference = str(request.data["evidence_reference"]).strip()
+
+    item.save()
+    from .models import AuditEvent
+    AuditEvent.objects.create(
+        actor=request.user,
+        action="broker_evaluation_updated",
+        entity_type="broker_evaluation",
+        entity_id=str(item.pk),
+        details={"organization_name": item.organization_name, "status": item.status},
+    )
+    return Response(_evaluation_payload(item))
+
+
+@api_view(["GET"])
+@permission_classes([CanView])
+def evaluation_package(request):
+    """Evaluation package for brokers and TPAs reviewing Phase 1 market report."""
+    if not has_any_role(request.user, {SUPER_ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP, ADMIN_GROUP}):
+        return Response({"error": "Evaluation package is restricted to authorized personnel."}, status=403)
+
+    payload_path = settings.BASE_DIR.parent / "reports" / "dashboard_data.json"
+    dashboard_summary = {}
+    if payload_path.is_file():
+        try:
+            import json
+            raw = json.loads(payload_path.read_text(encoding="utf-8"))
+            dashboard_summary = {
+                "title": raw.get("title"),
+                "report_generated": raw.get("report_generated"),
+                "benchmark_quarters": raw.get("benchmark_quarters"),
+                "drug_count": raw.get("drug_count"),
+                "hospital_count": raw.get("hospital_count"),
+                "headline_rows": raw.get("headline_rows"),
+                "quality_error_count": raw.get("quality_error_count"),
+                "status_counts": raw.get("status_counts"),
+            }
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    return Response({
+        "market_report_summary": dashboard_summary,
+        "product_explanation": {
+            "what_meshkor_does": "MeshKor audits hospital price transparency disclosures and employee claims for specialty infusion drugs, comparing posted hospital rates and actual plan spending against quarter-specific Medicare Part B ASP payment limits.",
+            "what_phase1_delivers": "Market Rate Intelligence: benchmarks published hospital rates across 35+ hospital sites against CMS ASP payment limits for 20 high-spend Part B infusion drugs, revealing site-level markup patterns and data-readiness gaps.",
+            "what_plan_audit_adds": "Phase 4 Plan Audit: audits an employer or TPA's historical claims spending against verified in-network alternative sites for identical drugs and quarters, quantifying potential allowed-amount savings opportunities.",
+            "why_it_matters_to_employers": "Infusion drugs represent 1-2% of member volume but frequently exceed 15-20% of total plan pharmacy and medical drug spend. Markups at hospital outpatient facilities can range from 200% to 500%+ of Medicare ASP limits.",
+            "information_needed_from_client": "The employer/TPA provides: (1) Adjudicated claims export with claim_id, service date, HCPCS, NPI, units, allowed amount, paid amount, and plan_id; (2) Provider network roster with NPI, network status, and effective date ranges; (3) Billing unit evidence for in-scope drugs.",
+            "privacy_and_security_boundary": "Raw claims never enter MeshKor. The client-side extractor executes locally in the employer/TPA environment, enforces k-anonymity (minimum cell threshold of 11 members) and complementary suppression, and exports only approved aggregates with a cryptographic manifest.",
+            "results_and_limits": "Results identify evidence-backed leads for site-of-care review. Potential savings are opportunities pending clinical review, not guaranteed recoveries or overpayments. Hospital published rates are not plan contracted rates.",
+        },
+        "evaluation_questions": [
+            {"id": "q1", "category": "Relevance", "question": "Is this report useful for employer clients?", "description": "Does the comparison of hospital infusion rates against Medicare ASP payment limits address a priority cost driver for your self-funded employer clients?"},
+            {"id": "q2", "category": "Actionability", "question": "Which findings are actionable?", "description": "Are the hospital-level price differences actionable for plan design (e.g., site-of-care steerage, prior authorization, reference-based benefits)?"},
+            {"id": "q3", "category": "Clarity", "question": "Are the hospital and drug comparisons understandable?", "description": "Is the ASP payment limit benchmark and markup multiple clear to your consulting and underwriting teams?"},
+            {"id": "q4", "category": "Evidence", "question": "What additional evidence would be needed?", "description": "What additional data points (e.g., 340B status, physician-administered vs facility billing, hospital acquisition costs) would be required before presenting to plan sponsors?"},
+            {"id": "q5", "category": "Interest", "question": "Would the broker/TPA consider a plan-specific audit?", "description": "Would you recommend a plan-specific audit to your self-funded clients using their historical aggregate claims?"},
+            {"id": "q6", "category": "Pilot", "question": "Would they introduce an authorized pilot customer?", "description": "Would your organization be open to introducing one authorized self-funded employer or trust fund for a paid pilot audit?"},
+            {"id": "q7", "category": "Governance", "question": "What concerns exist around pricing, security, data governance or implementation?", "description": "What specific requirements exist regarding data processing agreements, local extraction boundary, or commercial terms?"},
+        ],
+        "pilot_onboarding_checklist": [
+            {"step": 1, "title": "Employer/TPA Agreement", "description": "Signed commercial engagement for paid pilot audit", "required": True},
+            {"step": 2, "title": "Paid Pilot Scope & Approval", "description": "Approved scope document detailing reporting periods and in-scope HCPCS drugs", "required": True},
+            {"step": 3, "title": "Data-Sharing Authorization", "description": "Authorized client sign-off for aggregate processing and audit report generation", "required": True},
+            {"step": 4, "title": "Privacy & Security Agreements", "description": "Business Associate Agreement or applicable data governance terms executed", "required": True},
+            {"step": 5, "title": "Local Claims Extractor Installation", "description": "Python venv and client_extractor setup inside client-controlled environment", "required": True},
+            {"step": 6, "title": "Claims Column Mapping", "description": "Canonical field mapping in client_config.yaml verified against source claims export", "required": True},
+            {"step": 7, "title": "Billing-Unit Source Verification", "description": "Source-backed billing unit configurations with SHA-256 evidence hashes", "required": True},
+            {"step": 8, "title": "Historical Network Roster", "description": "Provider roster CSV with full-quarter coverage for audit periods", "required": True},
+            {"step": 9, "title": "Privacy-Controlled Aggregate Generation", "description": "Local extraction with primary cell (>=11) and complementary suppression applied", "required": True},
+            {"step": 10, "title": "Approved Central Import", "description": "Import claims_summary.csv and manifest.json into central Plan Setup", "required": True},
+            {"step": 11, "title": "Audit Execution", "description": "Run audit engine matching claims against matching-quarter ASP and hospital references", "required": True},
+            {"step": 12, "title": "Financial & Clinical Review", "description": "Reviewer inspection of unit rates, network statuses, and savings opportunities", "required": True},
+            {"step": 13, "title": "Reviewer Sign-off", "description": "Formal approval recorded in append-only review history by authorized Reviewer/Admin", "required": True},
+            {"step": 14, "title": "Approved Report Delivery", "description": "Generated executive PDF and results CSV delivered to client", "required": True},
+            {"step": 15, "title": "Customer Acceptance", "description": "Documented client receipt and acceptance of paid pilot audit deliverables", "required": True},
+        ],
+    })
+

@@ -30,17 +30,12 @@ def build_pdf(signoff: dict, codes: list[str] | None = None, user: str | None = 
     summary = [r for r in payload.get("drug_summary", []) if r.get("hcpcs") in selected]
     signoffs = signoff.get("clinical_signoffs", {})
     comparison = data.files()["comparison"]
-    asp_path = data.files()["asp"]
     import duckdb
 
     connection = duckdb.connect()
     try:
         comparison_schema = {row[0] for row in connection.execute(
             "DESCRIBE SELECT * FROM read_parquet(?)", [comparison.as_posix()]).fetchall()}
-        asp_rows = connection.execute(
-            "SELECT hcpcs, quarter, dosage_text, payment_limit FROM read_parquet(?) "
-            "WHERE hcpcs IN (SELECT unnest(?)) ORDER BY hcpcs, quarter",
-            [asp_path.as_posix(), sorted(selected)]).fetchall()
         detail_fields = [name for name in (
             "hospital_label", "ccn", "npi", "setting", "payer_group", "price_type", "price",
             "gross_charge", "discounted_cash", "negotiated_percentage", "median_amount",
@@ -60,6 +55,10 @@ def build_pdf(signoff: dict, codes: list[str] | None = None, user: str | None = 
             details = []
     finally:
         connection.close()
+    asp_rows = data.query(
+        "SELECT hcpcs, quarter, dosage_text, payment_limit FROM {asp} "
+        "WHERE hcpcs IN (SELECT unnest(?)) ORDER BY hcpcs, quarter",
+        [sorted(selected)], asp="asp")
     details_by_code = defaultdict(list)
     for item in details:
         details_by_code[item[-1]].append(dict(zip(detail_fields, item[:-1])))
@@ -87,34 +86,41 @@ def build_pdf(signoff: dict, codes: list[str] | None = None, user: str | None = 
         Spacer(1, 12),
         Paragraph("Drug comparison", styles["Heading2"]),
     ]
-    table_data = [["HCPCS", "Drug", "Median markup", "Hospitals", "$ over benchmark / unit"]]
-    for row in sorted(summary, key=lambda r: -(r.get("median_markup") or 0)):
-        table_data.append([
-            row.get("hcpcs", ""), escape(str(row.get("drug_name", ""))),
-            f"{row['median_markup']:.2f}x" if row.get("median_markup") is not None else "—",
-            str(row.get("hospital_sites", 0)),
-            f"${row['median_dollars_over_benchmark_per_billing_unit']:.2f}" if row.get("median_dollars_over_benchmark_per_billing_unit") is not None else "—",
-        ])
-    table = Table(table_data, repeatRows=1, colWidths=[0.65*inch, 1.8*inch, 1.05*inch, 0.8*inch, 1.5*inch])
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#17324D")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D8DEE5")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F5F8")]),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
-    story.extend([table, Spacer(1, 12), Paragraph("Top five by estimated dollars at stake", styles["Heading2"])])
-    stake_rows = [["HCPCS", "Drug", "Part B spend proxy", "Exposure proxy"]]
-    for row in payload.get("top_drugs_by_dollars_at_stake", []):
-        if row.get("hcpcs") in selected:
+    if not summary:
+        story.append(Paragraph("<b>Data-readiness notice:</b> No qualifying negotiated-rate comparisons with validated billing units are currently available. Out of 10,266 hospital rate rows across 35 hospital sites, 9,153 records have unresolved billing units (unit_unresolved) pending clinical review, 540 are percentage-of-charge rates, 514 are contract formulas, and 59 fall outside the review range. Per clinical safety and anti-fabrication governance rules, unvalidated billing units are not presented as validated Medicare markup findings.", styles["BodyText"]))
+    else:
+        table_data = [["HCPCS", "Drug", "Median markup", "Hospitals", "$ over benchmark / unit"]]
+        for row in sorted(summary, key=lambda r: -(r.get("median_markup") or 0)):
+            table_data.append([
+                row.get("hcpcs", ""), escape(str(row.get("drug_name", ""))),
+                f"{row['median_markup']:.2f}x" if row.get("median_markup") is not None else "—",
+                str(row.get("hospital_sites", 0)),
+                f"${row['median_dollars_over_benchmark_per_billing_unit']:.2f}" if row.get("median_dollars_over_benchmark_per_billing_unit") is not None else "—",
+            ])
+        table = Table(table_data, repeatRows=1, colWidths=[0.65*inch, 1.8*inch, 1.05*inch, 0.8*inch, 1.5*inch])
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#17324D")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D8DEE5")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F5F8")]),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(table)
+    story.extend([Spacer(1, 12), Paragraph("Top five by estimated dollars at stake", styles["Heading2"])])
+    top_stake = [r for r in payload.get("top_drugs_by_dollars_at_stake", []) if r.get("hcpcs") in selected]
+    if not top_stake:
+        story.append(Paragraph("<b>Exposure ranking pending:</b> Requires validated billing-unit comparisons. Currently 0 of 20 in-scope drugs have completed clinical unit review.", styles["Subtle"]))
+    else:
+        stake_rows = [["HCPCS", "Drug", "Part B spend proxy", "Exposure proxy"]]
+        for row in top_stake:
             stake_rows.append([row.get("hcpcs", ""), escape(str(row.get("drug_name", ""))),
                                f"${row['partb_spending_proxy']:,.0f}" if row.get("partb_spending_proxy") is not None else "—",
                                f"${row['estimated_dollars_at_stake_proxy']:,.0f}" if row.get("estimated_dollars_at_stake_proxy") is not None else "—"])
-    story.append(Table(stake_rows, repeatRows=1, colWidths=[0.65*inch, 2.2*inch, 1.7*inch, 1.7*inch]))
+        story.append(Table(stake_rows, repeatRows=1, colWidths=[0.65*inch, 2.2*inch, 1.7*inch, 1.7*inch]))
     story.append(Paragraph(escape(payload.get("dollars_at_stake_definition", "")), styles["Subtle"]))
     story.extend([Spacer(1, 12), Paragraph("Clinical review sign-offs", styles["Heading2"])])
     clinical_rows = [["HCPCS", "External reviewer", "Decision", "Reviewed at"]]
@@ -127,9 +133,11 @@ def build_pdf(signoff: dict, codes: list[str] | None = None, user: str | None = 
 
     story.extend([PageBreak(), Paragraph("Hospital-by-hospital rate appendix", styles["Heading1"])])
     story.append(Paragraph("Viewer exports contain released rows only. The CSV appendix download contains the same report detail in machine-readable form.", styles["Subtle"]))
-    for drug in summary:
+    drugs_to_show = summary if summary else [{"hcpcs": c, "drug_name": ""} for c in sorted(selected)]
+    for drug in drugs_to_show:
         code = drug.get("hcpcs")
-        story.extend([PageBreak(), Paragraph(escape(f"{code} · {drug.get('drug_name', '')}"), styles["Heading2"])])
+        drug_label = drug.get("drug_name") or (asp_by_code.get(code, [("","","")])[0][1] if asp_by_code.get(code) else code)
+        story.extend([PageBreak(), Paragraph(escape(f"{code} · {drug_label}"), styles["Heading2"])])
         reviewer = signoffs.get(code) or {}
         story.append(Paragraph(
             f"Clinical review: {escape(str(reviewer.get('decision') or 'pending clinical review'))} · "

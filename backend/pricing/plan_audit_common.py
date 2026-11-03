@@ -5,7 +5,10 @@ from django.shortcuts import get_object_or_404
 from .models import (
     ClaimsSummaryImport, Plan, PlanAudit, PlanOrganization,
 )
-from .permissions import ADMIN_GROUP, CLIENT_GROUP, VIEWER_GROUP, has_any_role
+from .permissions import (
+    ADMIN_GROUP, ANALYST_GROUP, CLIENT_GROUP, REVIEWER_GROUP,
+    SUPER_ADMIN_GROUP, VIEWER_GROUP, has_any_role,
+)
 
 
 def is_admin(user):
@@ -43,9 +46,21 @@ def get_visible_audit(user, audit_id):
     )
     if not is_admin(user):
         audits = audits.filter(organization__user_access__user=user).distinct()
-    if has_any_role(user, {CLIENT_GROUP, VIEWER_GROUP}):
-        audits = audits.filter(report_generated_at__isnull=False,
-                               reviews__review_status="approved").distinct()
+        if (has_any_role(user, {CLIENT_GROUP, VIEWER_GROUP})
+                and not has_any_role(user, {SUPER_ADMIN_GROUP, ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP})):
+            from django.db.models import OuterRef, Subquery
+            from .models import AuditReview
+            latest_status = Subquery(
+                AuditReview.objects.filter(plan_audit=OuterRef("pk"))
+                .order_by("-reviewed_at", "-id")
+                .values("review_status")[:1]
+            )
+            audits = audits.filter(
+                status="completed",
+                report_generated_at__isnull=False,
+            ).annotate(latest_review_status=latest_status).filter(
+                latest_review_status="approved"
+            )
     return get_object_or_404(audits, pk=audit_id)
 
 

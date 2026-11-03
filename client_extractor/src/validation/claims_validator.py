@@ -33,9 +33,12 @@ def parse_date(value):
     if not raw:
         raise ValueError("service_date is required")
     try:
-        return date.fromisoformat(raw[:10])
+        return date.fromisoformat(raw)
     except ValueError as exc:
-        raise ValueError("service_date must be an ISO date") from exc
+        try:
+            return datetime.fromisoformat(raw).date()
+        except ValueError:
+            raise ValueError("service_date must be an ISO date or ISO datetime") from exc
 
 
 def parse_decimal(value, field, *, positive=False):
@@ -47,6 +50,11 @@ def parse_decimal(value, field, *, positive=False):
     if not result.is_finite() or result < 0 or (positive and result <= 0):
         qualifier = "greater than zero" if positive else "a non-negative finite amount"
         raise ValueError(f"{field} must be {qualifier}")
+    normalized = result.normalize()
+    scale = max(-normalized.as_tuple().exponent, 0)
+    integer_digits = max(normalized.adjusted() + 1, 0) if result else 1
+    if scale > 6 or integer_digits > 18:
+        raise ValueError(f"{field} supports at most 18 integer and 6 decimal digits")
     return result
 
 

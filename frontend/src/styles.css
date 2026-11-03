@@ -350,3 +350,25 @@ ul.plain { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 8p
 
 .plan-audit-error-details { max-width: 100%; max-height: 240px; overflow: auto; padding: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); white-space: pre-wrap; font-size: 11px; }
 .plan-audit-hash { display: block; max-width: 300px; overflow-wrap: anywhere; font-size: 10px; }
+
+/* ---- Tab navigation (Phase 4 Historical Analytics) ---- */
+.plan-audit-tabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 2px solid var(--line); margin: 0 0 2px; padding: 0 16px; background: var(--panel); }
+.plan-audit-tab { background: none; border: none; border-bottom: 2px solid transparent; margin-bottom: -2px; padding: 10px 16px; font-size: 13px; font-weight: 600; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.plan-audit-tab:hover { color: var(--ink); }
+.plan-audit-tab--active { color: var(--accent, #005fd3); border-bottom-color: var(--accent, #005fd3); }
+
+/* ---- Simple bar charts ---- */
+.plan-audit-chart { margin: 16px 0; }
+.plan-audit-chart-title { font-size: 12px; font-weight: 700; color: var(--muted); margin: 0 0 10px; text-transform: uppercase; letter-spacing: .04em; }
+.plan-audit-chart-bars { display: grid; gap: 8px; }
+.plan-audit-chart-row { display: grid; grid-template-columns: 90px 1fr 110px; gap: 8px; align-items: center; font-size: 12px; }
+.plan-audit-chart-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-weight: 600; }
+.plan-audit-chart-bar-track { background: var(--bg); border: 1px solid var(--line); border-radius: 3px; height: 14px; overflow: hidden; }
+.plan-audit-chart-bar { height: 100%; background: var(--accent, #005fd3); border-radius: 2px; transition: width .3s ease; }
+.plan-audit-chart-value { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* ---- Filters: extend to 4 columns when space allows ---- */
+@media (min-width: 800px) {
+  .plan-audit-filters { grid-template-columns: repeat(4, minmax(120px, 240px)); }
+}
+

@@ -1,7 +1,7 @@
 """Versioned API routes with descriptive canonical paths and legacy aliases."""
 from django.urls import path
 
-from . import auth_views, views
+from . import auth_views, claims_views, views
 
 
 urlpatterns = [
@@ -50,8 +50,15 @@ urlpatterns = [
          name="hospital_drug_price_comparisons_excel_export"),
     path("hospital-file-quality/", views.quality, name="hospital_file_quality"),
     path("reports/market-analysis/pdf/", views.report_pdf, name="market_analysis_pdf_report"),
+    path("reports/evaluations/", views.broker_evaluations, name="broker_evaluations"),
+    path("reports/evaluations/<int:evaluation_id>/", views.broker_evaluation_detail, name="broker_evaluation_detail"),
+    path("reports/evaluation-package/", views.evaluation_package, name="evaluation_package"),
     path("reports/", views.report_records, name="report_catalog"),
     path("audit-logs/", views.audit_logs, name="audit_event_log"),
+    path("claims/", claims_views.claims_list, name="claims_explorer_list"),
+    path("claims/datasets/", claims_views.claims_datasets, name="claims_explorer_datasets"),
+    path("claims/synthea/summary/", claims_views.claims_synthea_summary, name="claims_synthea_summary"),
+    path("claims/<str:claim_id>/", claims_views.claims_detail, name="claims_explorer_detail"),
 
     # Compatibility aliases for clients that still call the earlier short paths.
     path("health/", views.health, name="legacy_short_health_check"),

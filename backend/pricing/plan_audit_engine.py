@@ -169,7 +169,7 @@ def _hospital_rows(codes, quarters):
             f"billing_units, status, price_type, source_file, source_sha256, effective_start, effective_end "
             f"FROM {{comparison}} WHERE hcpcs IN ({placeholders}) "
             f"AND benchmark_quarter IN ({q_placeholders}) "
-            f"AND price_type = 'negotiated_dollar' AND status IN ('ok','review_range') "
+            f"AND price_type = 'negotiated_dollar' AND status = 'ok' "
             f"AND price_per_billing_unit IS NOT NULL AND billing_units > 0",
             [*codes, *quarters], comparison="comparison",
         )

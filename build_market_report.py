@@ -232,13 +232,16 @@ def reference_coverage() -> dict:
     quarter_rows = []
     asp_path = ref_dir / "ref_asp.parquet"
     if asp_path.is_file():
-        table = pq.read_table(asp_path, columns=["quarter", "hcpcs"])
-        counts: dict[str, set[str]] = defaultdict(set)
-        for quarter, code in zip(table.column("quarter").to_pylist(), table.column("hcpcs").to_pylist()):
-            if quarter and code:
-                counts[str(quarter)].add(str(code))
-        quarter_rows = [{"quarter": quarter, "hcpcs_count": len(codes)}
-                        for quarter, codes in sorted(counts.items())]
+        schema_names = set(pq.ParquetFile(asp_path).schema_arrow.names)
+        q_col = "quarter" if "quarter" in schema_names else ("period" if "period" in schema_names else None)
+        if q_col:
+            table = pq.read_table(asp_path, columns=[q_col, "hcpcs"])
+            counts: dict[str, set[str]] = defaultdict(set)
+            for quarter, code in zip(table.column(q_col).to_pylist(), table.column("hcpcs").to_pylist()):
+                if quarter and code:
+                    counts[str(quarter)].add(str(code))
+            quarter_rows = [{"quarter": quarter, "hcpcs_count": len(codes)}
+                            for quarter, codes in sorted(counts.items())]
     return {"datasets": rows, "asp_quarters": quarter_rows}
 
 
@@ -562,6 +565,25 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
     }
     dashboard_data_path.write_text(json.dumps(dashboard_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    if not summary_rows:
+        ranking_section = (
+            "## Drug ranking\n\n"
+            "*Data-readiness notice: No negotiated rate comparisons currently meet all validation requirements for headline median markups. "
+            "Out of 10,266 hospital rate rows across 35 hospital sites, 9,153 records have unresolved billing units (`unit_unresolved`) "
+            "pending clinical unit review, 540 are percentage-of-charge contracts (`percent_of_charges`), 514 are algorithmic formulas (`algorithm_only`), "
+            "and 59 fall outside the configured review range (`review_range`). Clinical unit reviews are pending for all 20 in-scope drugs (0 of 20 reviewed). "
+            "Per clinical safety and anti-fabrication rules, unvalidated billing units and raw charges are excluded from median markup calculations. "
+            "See Data Quality below for complete row-level status breakdown.*"
+        )
+    else:
+        ranking_section = f"""## Drug ranking
+
+{markdown_table(['Rank', 'HCPCS', 'Drug', 'Median markup', 'Hospitals', 'Median $ over benchmark per billing unit'], rate_rank)}
+
+### Top five by estimated dollars at stake
+
+{markdown_table(['Rank', 'HCPCS', 'Drug', 'CMS Part B spend proxy', 'Estimated exposure proxy', 'Median markup'], stake_rank)}"""
+
     draft_label = "DRAFT"
     report = f"""# {config['title']} — {draft_label}
 
@@ -577,13 +599,7 @@ This run covers **{len(drug_codes)} current HCPCS drug codes**, **{len(all_hospi
 
 The first ranking is by median markup among rows matching the configured headline price type (`{config['headline_price_type']}`) and status (`{config['headline_status']}`). The “dollars at stake” ranking is an exposure proxy: CMS Medicare Part B spending for the drug multiplied by the positive portion of the median posted hospital rate markup above the ASP payment limit. It is not a savings estimate, hospital profit, or a guarantee that the same volume could move to another site. It assumes Medicare spending is a usable volume proxy for the posted hospital rates.
 
-## Drug ranking
-
-{markdown_table(['Rank', 'HCPCS', 'Drug', 'Median markup', 'Hospitals', 'Median $ over benchmark per billing unit'], rate_rank)}
-
-### Top five by estimated dollars at stake
-
-{markdown_table(['Rank', 'HCPCS', 'Drug', 'CMS Part B spend proxy', 'Estimated exposure proxy', 'Median markup'], stake_rank)}
+{ranking_section}
 
 Individual hospital comparisons, including payer-plan counts and unit-review flags, are in [`{outputs['sites']}`]({outputs['sites']}). Lower-markup sites are leads for further review; the report does not establish network status, clinical suitability, or physician agreement.
 

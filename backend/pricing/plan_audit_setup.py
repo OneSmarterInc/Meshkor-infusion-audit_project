@@ -6,13 +6,14 @@ import io
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.db.models import Count
+from django.http import Http404
 from rest_framework.decorators import api_view, permission_classes, parser_classes
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
 from .models import AuditEvent, NetworkRosterEntry, Plan, PlanOrganization, PlanOrganizationAccess
 from .permissions import (CanView, CanAnalyze, CLIENT_GROUP, VIEWER_GROUP,
-                          ANALYST_GROUP, SUPER_ADMIN_GROUP, has_any_role)
+                          ANALYST_GROUP, REVIEWER_GROUP, SUPER_ADMIN_GROUP, has_any_role)
 from .plan_audit_common import (
     get_visible_organization, get_visible_plan, is_admin, organization_payload,
     parse_iso_date, plan_payload, valid_npi, visible_organizations,
@@ -27,6 +28,13 @@ def _admin_required(request):
 
 def _filename(value):
     return str(value or "network_roster.csv").replace("\\", "/").split("/")[-1][:255]
+
+
+def _safe_roster_rows(reader):
+    try:
+        yield from reader
+    except csv.Error:
+        yield {"__csv_parse_error__": True}
 
 
 @api_view(["GET", "POST"])
@@ -68,8 +76,8 @@ def organization_access(request, organization_id):
                                             is_active=True, is_superuser=False)
     except (TypeError, ValueError, get_user_model().DoesNotExist):
         return Response({"error": "A valid active Viewer user_id is required."}, status=400)
-    if not user.groups.filter(name__in=(CLIENT_GROUP, VIEWER_GROUP, ANALYST_GROUP)).exists():
-        return Response({"error": "Organization access can be granted only to an Analyst or Client account."}, status=400)
+    if not user.groups.filter(name__in=(CLIENT_GROUP, VIEWER_GROUP, ANALYST_GROUP, REVIEWER_GROUP)).exists():
+        return Response({"error": "Organization access can be granted only to an Analyst, Reviewer, or Client account."}, status=400)
     access, created = PlanOrganizationAccess.objects.get_or_create(
         organization=organization, user=user, defaults={"granted_by": request.user})
     AuditEvent.objects.create(actor=request.user, action="plan_organization_viewer_access_granted",
@@ -178,8 +186,29 @@ def plan_network_roster(request, plan_id):
     plan = get_visible_plan(request.user, plan_id)
     if request.method == "GET":
         counts = list(plan.network_roster.values("network_status").annotate(count=Count("id")))
-        return Response({"plan_id": plan.pk, "entry_count": plan.network_roster.count(),
-                         "status_counts": counts})
+        response = {"plan_id": plan.pk, "entry_count": plan.network_roster.count(),
+                    "status_counts": counts, "quarter_coverage": None}
+        summary_import_id = request.query_params.get("summary_import_id")
+        if summary_import_id:
+            from .plan_audit_common import get_visible_import
+            try:
+                summary_import = get_visible_import(request.user, summary_import_id)
+            except (Http404, TypeError, ValueError):
+                return Response({"error": "The requested summary import is unavailable."}, status=404)
+            if summary_import.plan_id != plan.pk or summary_import.import_status != "accepted":
+                return Response({"error": "Select an accepted summary import for this plan."}, status=400)
+            from .plan_audit_engine import network_status_for
+            roster = list(plan.network_roster.all())
+            statuses = {}
+            for record in summary_import.records.values("site_npi", "quarter").distinct().iterator():
+                status = network_status_for(roster, record["site_npi"], record["quarter"])
+                statuses[status] = statuses.get(status, 0) + 1
+            response["quarter_coverage"] = {
+                "summary_import_id": summary_import.pk,
+                "site_quarters": sum(statuses.values()),
+                "status_counts": statuses,
+            }
+        return Response(response)
     if not has_any_role(request.user, {SUPER_ADMIN_GROUP, ANALYST_GROUP}):
         return Response({"error": "This action requires the Super Admin or Analyst role."}, status=403)
     upload = request.FILES.get("file")
@@ -188,7 +217,7 @@ def plan_network_roster(request, plan_id):
     raw = upload.read()
     digest = hashlib.sha256(raw).hexdigest()
     try:
-        reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig"), newline=""))
+        reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig"), newline=""), strict=True)
     except (UnicodeDecodeError, csv.Error):
         return Response({"error": "Network roster must be a valid UTF-8 CSV."}, status=400)
     fields = ["provider_npi", "provider_name", "network_name", "network_status",
@@ -196,8 +225,16 @@ def plan_network_roster(request, plan_id):
     if reader.fieldnames != fields:
         return Response({"error": "Network roster columns do not match the documented schema."}, status=400)
     rows, errors, unique = [], [], set()
-    for line, row in enumerate(reader, start=2):
+    for line, row in enumerate(_safe_roster_rows(reader), start=2):
+        if row.get("__csv_parse_error__"):
+            errors.append({"row": line, "reason": "Network roster CSV syntax is invalid."})
+            break
+        if line > 100_001:
+            errors.append({"row": line, "reason": "Network roster exceeds the 100,000 row limit."})
+            break
         try:
+            if None in row or any(row.get(field) is None for field in fields):
+                raise ValueError("Row has missing or extra columns.")
             if row.get("applicable_plan_reference") != plan.plan_reference:
                 raise ValueError("applicable_plan_reference does not match this plan.")
             npi = (row.get("provider_npi") or "").strip()
@@ -213,19 +250,20 @@ def plan_network_roster(request, plan_id):
             end = parse_iso_date(row.get("effective_end"), "effective_end", optional=True)
             if end and end < start:
                 raise ValueError("effective_end precedes effective_start.")
-            location = (row.get("service_location") or "").strip()[:240]
+            location = (row.get("service_location") or "").strip()
+            provider_name = (row.get("provider_name") or "").strip()
+            if len(location) > 240 or len(provider_name) > 200:
+                raise ValueError("provider_name or service_location exceeds its maximum length.")
             key = (npi, name, start, location)
             if key in unique:
                 raise ValueError("Duplicate provider-network-period row.")
             unique.add(key)
             rows.append(NetworkRosterEntry(
                 plan=plan, provider_npi=npi,
-                provider_name=(row.get("provider_name") or "").strip()[:200],
+                provider_name=provider_name,
                 network_name=name, network_status=status, effective_start=start,
                 effective_end=end, service_location=location,
                 source_file_name=_filename(upload.name), source_hash=digest))
-            if len(rows) > 100_000:
-                raise ValueError("Network roster exceeds the 100,000 row limit.")
         except (ValueError, TypeError) as exc:
             errors.append({"row": line, "reason": str(exc)})
             if len(errors) >= 500:
@@ -235,8 +273,24 @@ def plan_network_roster(request, plan_id):
     if errors:
         return Response({"error": "Network roster was rejected; no rows were stored.",
                          "rejected_rows": len(errors), "errors": errors}, status=400)
+    conflicts = _conflicting_roster_rows(rows)
+    if conflicts:
+        return Response({"error": "Network roster contains conflicting effective intervals; no rows were stored.",
+                         "rejected_rows": len(conflicts),
+                         "errors": [{"row": line, "reason": "Conflicting network statuses overlap for this provider."}
+                                    for line in conflicts]}, status=400)
     try:
         with transaction.atomic():
+            Plan.objects.select_for_update().get(pk=plan.pk)
+            existing = list(plan.network_roster.all())
+            conflicts = _conflicting_roster_entries(rows, existing)
+            if conflicts:
+                return Response({
+                    "error": "Network roster conflicts with existing effective intervals; no rows were stored.",
+                    "rejected_rows": len(conflicts),
+                    "errors": [{"row": line, "reason": "Conflicting network statuses overlap an existing provider interval."}
+                               for line in conflicts],
+                }, status=400)
             NetworkRosterEntry.objects.bulk_create(rows, batch_size=1000)
     except IntegrityError:
         return Response({"error": "Roster entries already exist. No entries were stored."}, status=409)
@@ -245,3 +299,34 @@ def plan_network_roster(request, plan_id):
                               details={"row_count": len(rows), "sha256": digest})
     return Response({"plan_id": plan.pk, "accepted_rows": len(rows), "sha256": digest,
                      "raw_roster_file_stored": False}, status=201)
+
+
+def _intervals_overlap(first_start, first_end, second_start, second_end):
+    return (first_end is None or second_start <= first_end) and (
+        second_end is None or first_start <= second_end
+    )
+
+
+def _conflicting_roster_rows(rows):
+    conflicts = set()
+    for index, item in enumerate(rows):
+        for other_index in range(index):
+            other = rows[other_index]
+            if (item.provider_npi == other.provider_npi
+                    and item.network_status != other.network_status
+                    and _intervals_overlap(item.effective_start, item.effective_end,
+                                           other.effective_start, other.effective_end)):
+                conflicts.update((index + 2, other_index + 2))
+    return sorted(conflicts)
+
+
+def _conflicting_roster_entries(rows, existing):
+    conflicts = set()
+    for index, item in enumerate(rows, start=2):
+        if any(item.provider_npi == other.provider_npi
+               and item.network_status != other.network_status
+               and _intervals_overlap(item.effective_start, item.effective_end,
+                                      other.effective_start, other.effective_end)
+               for other in existing):
+            conflicts.add(index)
+    return sorted(conflicts)

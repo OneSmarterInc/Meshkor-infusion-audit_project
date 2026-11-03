@@ -22,6 +22,7 @@ const AuditLogs = lazy(() => import("./pages/AuditLogs.jsx"));
 const Settings = lazy(() => import("./pages/Settings.jsx"));
 const UserManagement = lazy(() => import("./pages/UserManagement.jsx"));
 const PlanAudits = lazy(() => import("./pages/PlanAudits.jsx"));
+const ClaimsExplorer = lazy(() => import("./pages/ClaimsExplorer.jsx"));
 
 function Landing({ onLogin }) {
   const [username, setUsername] = useState("");
@@ -167,7 +168,7 @@ function Shell({ user, onLogout }) {
   const [search, setSearch] = useState("");
   const location = useLocation();
   const navigate = useNavigate();
-  const titles = { "/": "Overview", "/reference-data-sets": "Reference data", "/hospital-price-transparency-files": "Hospital price files", "/hospitals": "Hospitals", "/drug-selection-scope": "Drug selection scope", "/drug-unit-validations": "Drug unit validations", "/hospital-drug-price-comparisons": "Hospital drug price comparisons", "/data-sources": "Data sources", "/reports": "Reports & exports", "/plan-specific-audits": "Plan-specific audits", "/audit-logs": "Audit logs", "/application-settings": "Application settings", "/hospital-file-quality": "Hospital file quality", "/methodology": "Methodology", "/user-management": "User management" };
+  const titles = { "/": "Overview", "/reference-data-sets": "Reference data", "/hospital-price-transparency-files": "Hospital price files", "/hospitals": "Hospitals", "/drug-selection-scope": "Drug selection scope", "/drug-unit-validations": "Drug unit validations", "/hospital-drug-price-comparisons": "Hospital drug price comparisons", "/data-sources": "Data sources", "/reports": "Reports & exports", "/plan-specific-audits": "Plan-specific audits", "/claims-explorer": "Claims Explorer", "/claims": "Claims Explorer", "/audit-logs": "Audit logs", "/application-settings": "Application settings", "/hospital-file-quality": "Hospital file quality", "/methodology": "Methodology", "/user-management": "User management" };
   const pageTitle = titles[location.pathname] || "Infusion Drug Markup Audit";
   function submitSearch(event) {
     event.preventDefault();
@@ -183,6 +184,7 @@ function Shell({ user, onLogout }) {
           {user.roles?.some((role) => ["SUPER_ADMIN", "ANALYST", "Admin"].includes(role)) && <NavLink to="/drug-selection-scope"><span>#</span>{!collapsed && "Drug Scope"}</NavLink>}
           <NavLink to="/hospital-drug-price-comparisons"><span>↗</span>{!collapsed && "Comparisons"}</NavLink>
           <NavLink to="/plan-specific-audits"><span>◉</span>{!collapsed && "Plan Audits"}</NavLink>
+          <NavLink to="/claims-explorer"><span>▦</span>{!collapsed && "Claims Explorer"}</NavLink>
           <NavLink to="/reports"><span>▧</span>{!collapsed && "Reports"}</NavLink>
           <details className="sidebar-more">
             <summary><span>•••</span>{!collapsed && "More"}</summary>
@@ -193,6 +195,7 @@ function Shell({ user, onLogout }) {
                 <NavLink to="/reference-data-sets">Reference Data Sets</NavLink>
                 <NavLink to="/hospital-file-quality">Hospital File Quality</NavLink>
                 <NavLink to="/data-sources">Data Sources & Import</NavLink>
+                <NavLink to="/claims-explorer">Claims Explorer</NavLink>
               </>}
               {user.roles?.some((role) => ["SUPER_ADMIN", "REVIEWER", "Admin"].includes(role)) && <>
                 <NavLink to="/drug-unit-validations">Drug Unit Review</NavLink>
@@ -229,6 +232,8 @@ function Shell({ user, onLogout }) {
           <Route path="/data-sources" element={<AnalystOrAdmin user={user}><Sources user={user} /></AnalystOrAdmin>} />
           <Route path="/reports" element={<Reports user={user} />} />
           <Route path="/plan-specific-audits" element={<PlanAudits user={user} />} />
+          <Route path="/claims-explorer" element={<ClaimsExplorer user={user} />} />
+          <Route path="/claims" element={<Navigate to="/claims-explorer" replace />} />
           <Route path="/audit-logs" element={<AdminOnly user={user}><AuditLogs /></AdminOnly>} />
           <Route path="/user-management" element={<AdminOnly user={user}><UserManagement user={user} /></AdminOnly>} />
           <Route path="/application-settings" element={<Settings user={user} />} />
