@@ -45,7 +45,10 @@ def get_visible_import(user, import_id):
 
 def get_visible_audit(user, audit_id):
     audit = get_accessible_audit(user, audit_id)
-    if is_client_only(user) and not published_run(audit):
+    if is_client_only(user) and (
+            audit.organization.status != "active"
+            or audit.plan.status != "active"
+            or not published_run(audit)):
         from django.http import Http404
         raise Http404
     return audit

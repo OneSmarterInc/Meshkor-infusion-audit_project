@@ -21,6 +21,44 @@ function csrfCookie() {
   return document.cookie.split(";").map((v) => v.trim()).find((v) => v.startsWith("csrftoken="))?.slice(10) || "";
 }
 
+function refreshAccess() {
+  if (!refreshPromise) {
+    refreshPromise = request(API_ENDPOINTS.refreshAccessToken, {
+      method: "POST", body: "{}",
+    }, { skipBearer: true, retryAuth: false })
+      .then((refreshed) => {
+        accessToken = refreshed.access;
+        if (!accessToken) throw new Error("The session refresh did not return an access token.");
+        return refreshed;
+      })
+      .catch((error) => {
+        accessToken = null;
+        window.dispatchEvent(new Event("meshkor:session-expired"));
+        throw error;
+      })
+      .finally(() => { refreshPromise = null; });
+  }
+  return refreshPromise;
+}
+
+async function fetchWithAuth(url, options = {}, retryAuth = true) {
+  const headers = { ...(options.headers || {}) };
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  const response = await fetch(url, { ...options, headers });
+  if (response.status !== 401 || !accessToken) return response;
+  if (!retryAuth) {
+    accessToken = null;
+    window.dispatchEvent(new Event("meshkor:session-expired"));
+    return response;
+  }
+  try {
+    await refreshAccess();
+    return fetchWithAuth(url, options, false);
+  } catch {
+    return response;
+  }
+}
+
 async function request(path, options = {}, { skipBearer = false, retryAuth = true } = {}) {
   const method = options.method || "GET";
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
@@ -48,22 +86,7 @@ async function request(path, options = {}, { skipBearer = false, retryAuth = tru
     if (res.status === 401 && accessToken && cleanPath !== API_ENDPOINTS.refreshAccessToken) {
       if (retryAuth && canRefresh) {
         try {
-          if (!refreshPromise) {
-            refreshPromise = request(API_ENDPOINTS.refreshAccessToken, {
-              method: "POST", body: "{}",
-            }, { skipBearer: true, retryAuth: false })
-              .then((refreshed) => {
-                accessToken = refreshed.access;
-                return refreshed;
-              })
-              .catch((refreshError) => {
-                accessToken = null;
-                window.dispatchEvent(new Event("meshkor:session-expired"));
-                throw refreshError;
-              })
-              .finally(() => { refreshPromise = null; });
-          }
-          await refreshPromise;
+          await refreshAccess();
           return request(path, options, { retryAuth: false });
         } catch {
           throw error;
@@ -139,8 +162,7 @@ export async function uploadSource(sourceKey, file, metadata = {}) {
   if (metadata.system) form.append("system", metadata.system);
   if (metadata.snapshotDate) form.append("snapshot_date", metadata.snapshotDate);
   const headers = { "X-CSRFToken": csrfCookie() };
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-  const response = await fetch(`${API_ROOT}/${API_ENDPOINTS.sourceUpload}`, {
+  const response = await fetchWithAuth(`${API_ROOT}/${API_ENDPOINTS.sourceUpload}`, {
     method: "POST", body: form, credentials: "same-origin",
     headers,
   });
@@ -158,9 +180,7 @@ export function csvUrl(params) {
 }
 
 export async function downloadFile(path, filename) {
-  const headers = {};
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-  const res = await fetch(`${API_ROOT}/${path}`, { headers, credentials: "same-origin" });
+  const res = await fetchWithAuth(`${API_ROOT}/${path}`, { credentials: "same-origin" });
   if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
   const blob = await res.blob();
   const url = window.URL.createObjectURL(blob);
@@ -229,8 +249,7 @@ async function uploadForm(path, form) {
   await request(API_ENDPOINTS.csrfToken);
   const cleanPath = path.split("/").filter(Boolean).join("/");
   const headers = { "X-CSRFToken": csrfCookie() };
-  if (accessToken) headers.Authorization = "Bearer " + accessToken;
-  const response = await fetch(API_ROOT + "/" + cleanPath + "/", {
+  const response = await fetchWithAuth(API_ROOT + "/" + cleanPath + "/", {
     method: "POST", body: form, credentials: "same-origin", headers,
   });
   const body = await response.json().catch(() => ({}));

@@ -19,7 +19,13 @@ def aggregate_claims(claims, *, plan_reference, source_period, extracted_at, bil
 def _aggregate_claims(claims, *, plan_reference, source_period, extracted_at, billing_units):
     groups = defaultdict(lambda: {"units": Decimal(0), "allowed": Decimal(0),
                                   "paid": Decimal(0), "members": set()})
-    quality = {"reasons": {}, "excluded_records": 0}
+    quality = {
+        "reasons": {},
+        "excluded_records": 0,
+        "suppressed_aggregate_cells": 0,
+        "rejected_aggregate_cells": 0,
+        "aggregate_cell_reasons": {},
+    }
     for claim in claims:
         if claim["hcpcs_code"] not in billing_units:
             _reason(quality, "billing_unit_not_configured")
@@ -37,10 +43,10 @@ def _aggregate_claims(claims, *, plan_reference, source_period, extracted_at, bi
     for key, values in groups.items():
         if len(values["members"]) < 11:
             suppressed.add((key[0], key[1], key[3], key[4]))
-            _reason(quality, "small_cell_suppressed")
+            _cell_reason(quality, "small_cell_suppressed", suppressed=True)
             continue
         if not all(_fits_import_decimal(values[field]) for field in ("units", "allowed", "paid")):
-            _reason(quality, "aggregate_exceeds_import_precision")
+            _cell_reason(quality, "aggregate_exceeds_import_precision")
             continue
         band = "11-50" if len(values["members"]) <= 50 else "51-100" if len(values["members"]) <= 100 else "100+"
         row = {
@@ -68,17 +74,27 @@ def _aggregate_claims(claims, *, plan_reference, source_period, extracted_at, bi
     for row in rows:
         parent = (row["plan_reference"], row["hcpcs_code"], row["quarter"], row["service_setting"])
         if (parent, row["site_npi"]) in complementary:
-            _reason(quality, "complementary_suppressed")
+            _cell_reason(quality, "complementary_suppressed", suppressed=True)
             continue
         row.pop("_member_count_for_local_suppression", None)
         exported.append(row)
     quality["exported_aggregate_rows"] = len(exported)
+    quality["excluded_aggregate_cells"] = sum(quality["aggregate_cell_reasons"].values())
     return exported, quality
 
 
 def _reason(quality, reason):
     quality["reasons"][reason] = quality["reasons"].get(reason, 0) + 1
     quality["excluded_records"] += 1
+
+
+def _cell_reason(quality, reason, *, suppressed=False):
+    reasons = quality["aggregate_cell_reasons"]
+    reasons[reason] = reasons.get(reason, 0) + 1
+    if suppressed:
+        quality["suppressed_aggregate_cells"] += 1
+    else:
+        quality["rejected_aggregate_cells"] += 1
 
 
 def _fits_import_decimal(value):

@@ -259,9 +259,11 @@ def test_four_role_backend_permission_matrix():
     client_user = User.objects.create_user(username="scoped-client", password="client-test-password")
     client_user.groups.add(Group.objects.get(name="CLIENT"))
     client_plan_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/plan-audits/")
-    client_public_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/hospitals/")
+    client_market_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/hospitals/")
+    client_claims_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/claims/")
     assert CanView().has_permission(client_plan_request, None)
-    assert not CanView().has_permission(client_public_request, None)
+    assert CanView().has_permission(client_market_request, None)
+    assert not CanView().has_permission(client_claims_request, None)
 
 
 @pytest.mark.django_db
@@ -509,6 +511,7 @@ def test_rates_filter_and_sort(client):
 
 def test_production_comparison_parquet_supports_rate_projection(monkeypatch):
     """Guard the real snapshot against DuckDB projected-column reader regressions."""
+    from decimal import Decimal
     from pricing import data
 
     comparison = BACKEND.parent / "data" / "mart" / "comparison.parquet"
@@ -516,13 +519,18 @@ def test_production_comparison_parquet_supports_rate_projection(monkeypatch):
     monkeypatch.setattr(data, "require_current_scope", lambda: "verified_source")
 
     rows = data.query(
-        "SELECT hospital_key, price, asp_payment_limit, markup_multiple FROM {cmp} "
+        "SELECT hospital_key, price_per_billing_unit, asp_payment_limit, markup_multiple FROM {cmp} "
         "ORDER BY markup_multiple DESC NULLS LAST LIMIT 50 OFFSET 0",
         cmp="comparison",
     )
     assert len(rows) == 50
-    assert str(rows[0]["markup_multiple"]) == "0.33013196677384780278670953910"
-    assert str(rows[-1]["markup_multiple"]) == "0.11088290460878885316184351550"
+    priced = [row for row in rows if row["markup_multiple"] is not None]
+    assert priced
+    multiples = [Decimal(str(row["markup_multiple"])) for row in priced]
+    assert multiples == sorted(multiples, reverse=True)
+    for row in priced:
+        calculated = Decimal(str(row["price_per_billing_unit"])) / Decimal(str(row["asp_payment_limit"]))
+        assert abs(calculated - Decimal(str(row["markup_multiple"]))) < Decimal("1e-18")
 
 
 def test_comparison_payer_filter_options_come_from_parquet(client):
@@ -1268,7 +1276,7 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     assert result["source_references"]["unit_review_status"] == "unresolved"
     assert Decimal(result["plan_allowed_price_per_unit"]) == Decimal("150")
     assert Decimal(result["plan_paid_price_per_unit"]) == Decimal("120")
-    assert client.get(f"/api/v1/plan-audits/{audit_id}/savings/").json() == []
+    assert client.get(f"/api/v1/plan-audits/{audit_id}/savings/").json()["results"] == []
 
     # The actual unresolved engine output must not be publishable.
     from pricing.models import (AuditEvent, AuditReview, PlanAudit, PlanAuditResult,
@@ -2077,6 +2085,7 @@ def test_synthea_dataset_registration_and_category(client):
 
 def test_synthea_summary_and_quality_endpoint(client):
     from pricing.models import ClaimsExplorerDataset, PlanOrganization
+    from pricing.claims_views import _synthea_manifest_path
 
     org = PlanOrganization.objects.create(
         organization_name="Synthea Analytics Org", organization_type="employer",
@@ -2089,6 +2098,12 @@ def test_synthea_summary_and_quality_endpoint(client):
     ClaimsExplorerDataset.objects.create(
         organization=org, dataset_identifier="synthea_sample_data", category="synthetic_demo",
     )
+
+    if not _synthea_manifest_path().is_file():
+        unavailable = client.get(f"/api/v1/claims/synthea/summary/?organization_id={org.pk}")
+        assert unavailable.status_code == 503
+        assert "manifest is unavailable" in unavailable.json()["error"].lower()
+        return
 
     # 200 after registration
     res = client.get(f"/api/v1/claims/synthea/summary/?organization_id={org.pk}")
@@ -2110,6 +2125,7 @@ def test_synthea_summary_and_quality_endpoint(client):
 
 def test_synthea_subtable_queries_and_privacy(client):
     from pricing.models import ClaimsExplorerDataset, PlanOrganization
+    from pricing.claims_views import _synthea_manifest_path
 
     org = PlanOrganization.objects.create(
         organization_name="Synthea Subtables Org", organization_type="broker",
@@ -2117,6 +2133,15 @@ def test_synthea_subtable_queries_and_privacy(client):
     ClaimsExplorerDataset.objects.create(
         organization=org, dataset_identifier="synthea_sample_data", category="synthetic_demo",
     )
+
+    if not _synthea_manifest_path().is_file():
+        unavailable = client.get("/api/v1/claims/", {
+            "organization_id": org.pk, "dataset": "synthea_sample_data",
+            "subtable": "encounters", "page_size": 10,
+        })
+        assert unavailable.status_code == 503
+        assert "unavailable" in unavailable.json()["error"].lower()
+        return
 
     # 1. Encounters query
     enc_res = client.get("/api/v1/claims/", {

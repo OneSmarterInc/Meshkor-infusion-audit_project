@@ -68,6 +68,49 @@ def test_expired_sign_in_challenge_is_rejected():
     assert "challenge expired" in response.json()["error"]
 
 
+@pytest.mark.django_db
+def test_password_login_failures_are_shared_across_clients():
+    path = "/api/v1/auth/login/"
+    for _ in range(5):
+        response = Client().post(path, {
+            "username": "distributed-throttle-target", "password": "incorrect",
+        }, content_type="application/json")
+        assert response.status_code == 401
+    blocked = Client().post(path, {
+        "username": "distributed-throttle-target", "password": "incorrect",
+    }, content_type="application/json")
+    assert blocked.status_code == 429
+    assert blocked.json()["retry_after_seconds"] > 0
+
+
+@pytest.mark.django_db
+def test_successful_login_does_not_clear_other_accounts_source_failures():
+    User = get_user_model()
+    target = User.objects.create_user(username="throttle-target", password="right-password")
+    target.groups.add(Group.objects.get_or_create(name="ANALYST")[0])
+    other = User.objects.create_user(username="throttle-other", password="right-password")
+    other.groups.add(Group.objects.get_or_create(name="ANALYST")[0])
+    path = "/api/v1/auth/login/"
+
+    assert Client(REMOTE_ADDR="192.0.2.45").post(path, {
+        "username": target.username, "password": "wrong-password",
+    }, content_type="application/json").status_code == 401
+    success = Client(REMOTE_ADDR="192.0.2.45").post(path, {
+        "username": other.username, "password": "right-password",
+    }, content_type="application/json")
+    assert success.status_code == 200
+    assert success.json()["otp_setup_required"] is True
+    for _ in range(4):
+        failed = Client(REMOTE_ADDR="192.0.2.45").post(path, {
+            "username": target.username, "password": "wrong-password",
+        }, content_type="application/json")
+        assert failed.status_code == 401
+    blocked = Client(REMOTE_ADDR="192.0.2.45").post(path, {
+        "username": target.username, "password": "wrong-password",
+    }, content_type="application/json")
+    assert blocked.status_code == 429
+
+
 @override_settings(TOTP_ENCRYPTION_KEY="F5wrMMH6I5kTnhPaaWqFvxLQmNY4J5kmWh0-e4jxQYc=")
 @pytest.mark.django_db
 def test_canonical_password_totp_and_session_refresh_flow():
@@ -151,6 +194,40 @@ def test_admin_authenticator_is_required_after_password_and_code_cannot_replay(d
         "challenge": recovery_challenge, "recovery_code": recovery_codes[1],
     }, content_type="application/json")
     assert duplicate_recovery.status_code == 401
+
+
+@override_settings(TOTP_ENCRYPTION_KEY="F5wrMMH6I5kTnhPaaWqFvxLQmNY4J5kmWh0-e4jxQYc=")
+def test_otp_challenge_is_single_use_and_invalidated_by_password_change(db, built):
+    user = get_user_model().objects.create_user(
+        username="single-use-challenge", password="test-only-password", is_active=True,
+    )
+    user.groups.add(Group.objects.get_or_create(name="ANALYST")[0])
+    AdminOTPDevice.objects.create(user=user, secret=encrypt_secret(new_secret()), enabled=True)
+
+    client = Client()
+    challenge = client.post("/api/v1/auth/login/", {
+        "username": user.username, "password": "test-only-password",
+    }, content_type="application/json").json()["challenge"]
+    with patch("pricing.auth_views.verify_code", side_effect=[10, 11]):
+        first = client.post("/api/v1/auth/otp/complete/", {
+            "challenge": challenge, "code": "123456",
+        }, content_type="application/json")
+        replay = client.post("/api/v1/auth/otp/complete/", {
+            "challenge": challenge, "code": "654321",
+        }, content_type="application/json")
+    assert first.status_code == 200
+    assert replay.status_code == 401
+
+    fresh_client = Client()
+    challenge_after_password = fresh_client.post("/api/v1/auth/login/", {
+        "username": user.username, "password": "test-only-password",
+    }, content_type="application/json").json()["challenge"]
+    user.set_password("changed-test-password")
+    user.save(update_fields=["password"])
+    rejected = fresh_client.post("/api/v1/auth/otp/complete/", {
+        "challenge": challenge_after_password, "code": "123456",
+    }, content_type="application/json")
+    assert rejected.status_code == 401
 
 
 @override_settings(TOTP_ENCRYPTION_KEY="F5wrMMH6I5kTnhPaaWqFvxLQmNY4J5kmWh0-e4jxQYc=")

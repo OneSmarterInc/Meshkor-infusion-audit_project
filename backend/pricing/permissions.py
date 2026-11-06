@@ -53,7 +53,18 @@ class CanView(BasePermission):
                 and not has_any_role(request.user, {SUPER_ADMIN_GROUP, ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP})):
             path = request.path.rstrip("/") + "/"
             client_routes = ("/organizations/", "/plans/", "/plan-audits/")
-            allowed = request.method == "GET" and any(route in path for route in client_routes)
+            released_market_routes = (
+                "/api/v1/dashboard/summary/",
+                "/api/v1/dashboard/price-trends/",
+                "/api/v1/medicare-part-b-drugs/",
+                "/api/v1/hospitals/",
+                "/api/v1/hospital-drug-price-comparisons/",
+                "/api/v1/reports/",
+            )
+            allowed = request.method == "GET" and (
+                any(route in path for route in client_routes)
+                or any(path.startswith(route) for route in released_market_routes)
+            )
         if allowed:
             _log_read(request)
         return allowed

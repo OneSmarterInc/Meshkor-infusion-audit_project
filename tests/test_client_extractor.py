@@ -91,6 +91,16 @@ def test_extractor_exports_only_suppressed_aggregates_and_source_provenance(tmp_
     quality = (output / "data_quality.json").read_text(encoding="utf-8")
     assert "claim-000" not in quality and "member-000" not in quality
 
+    # A later non-exportable run must not leave the earlier approved pair looking current.
+    _write_source(claims_path, rows[:1])
+    assert extract_claims(Namespace(claims=claims_path, config=config_path, output=output)) == 1
+    assert not (output / "claims_summary.csv").exists()
+    assert not (output / "manifest.json").exists()
+    archives = list((output / "history").iterdir())
+    assert len(archives) == 1
+    assert (archives[0] / "claims_summary.csv").is_file()
+    assert (archives[0] / "manifest.json").is_file()
+
 
 def test_adjustment_reversal_and_denied_rows_are_not_double_counted():
     original = validate_claim(_raw_claim("original", "member-1"), 2)
@@ -362,8 +372,11 @@ def test_primary_and_complementary_suppression_rules():
     # Thus only Site 1 (15 members) is exported.
     assert len(exported) == 1
     assert exported[0]["site_npi"] == "1000000004"
-    assert quality["reasons"]["small_cell_suppressed"] == 1
-    assert quality["reasons"]["complementary_suppressed"] == 1
+    assert quality["aggregate_cell_reasons"]["small_cell_suppressed"] == 1
+    assert quality["aggregate_cell_reasons"]["complementary_suppressed"] == 1
+    assert quality["suppressed_aggregate_cells"] == 2
+    assert quality["excluded_aggregate_cells"] == 2
+    assert quality["excluded_records"] == 0
 
 
 def test_missing_billing_unit_excludes_claim_from_export():
