@@ -1,0 +1,9 @@
+hcpcs_billing_units:
+  J9271:
+    qty: 1
+    source_reference: TEST-only unit evidence
+    source_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    unit: UNIT
+    verification_status: validated
+plan_id: PLAN-TEST-ID
+plan_reference: PLAN-E2E-2026

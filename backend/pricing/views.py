@@ -729,7 +729,7 @@ def reference_table(request, dataset_name: str):
 
 
 @api_view(["GET"])
-@permission_classes([CanAdminister])
+@permission_classes([CanReview])
 def drug_scope_status(request):
     from pipeline.common import paths
     scope_path = paths()["ref"] / "drug_scope.parquet"
@@ -745,20 +745,30 @@ def drug_scope_status(request):
         reviews = {row["hcpcs"]: row for row in DrugUnitReview.objects.filter(
             scope_source_sha256=info.get("drug_selection_source_sha256")).values(
                 "hcpcs", "status", "notes", "billing_qty", "billing_unit", "reviewed_at",
-                "clinical_reviewer_name", "reviewer__username")}
-        for drug in scope.values():
+                "clinical_reviewer_name", "reviewer__username", "scope_source_sha256")}
+        admin_access = has_any_role(request.user, {ADMIN_GROUP})
+        reviewer_access = has_any_role(request.user, {REVIEWER_GROUP})
+        visible_drugs = []
+        for source_drug in scope.values():
+            drug = source_drug
             review = reviews.get(drug["hcpcs"])
-            if has_any_role(request.user, {ADMIN_GROUP}):
+            if admin_access or reviewer_access:
                 drug["unit_review"] = review
-            else:
+            if reviewer_access and not admin_access:
+                clinical_fields = ("hcpcs", "name", "brand", "description", "billing_qty", "billing_unit",
+                                   "asp_quarter", "asp_dosage", "selection_source", "selection_source_file",
+                                   "selection_source_sha256", "unit_review")
+                drug = {key: drug.get(key) for key in clinical_fields}
+            elif not (admin_access or reviewer_access):
                 drug.pop("unit_review", None)
                 drug.pop("reviewed_by", None)
+            visible_drugs.append(drug)
         return Response({"status": "selected", "source": info.get("drug_selection_source"),
                          "source_file": info.get("drug_selection_source_file"),
                          "source_sha256": info.get("drug_selection_source_sha256"),
                          "spend_year": info.get("drug_selection_year"),
                          "target_count": target_count, "selected_count": len(scope),
-                         "drugs": list(scope.values())})
+                         "drugs": visible_drugs})
     except data.DataMissing as exc:
         return Response({"status": "blocked", "reason": str(exc), "scope_file_present": scope_path.is_file(),
                          "target_count": target_count, "selected_count": 0, "drugs": []})
@@ -841,8 +851,9 @@ def review_drug_unit(request, hcpcs: str):
 
 
 @api_view(["GET"])
-@permission_classes([CanAdminister])
+@permission_classes([CanReview])
 def unit_validations(request):
+    review_workflow = "An authorized Reviewer or Admin records an external clinical reviewer and evidence for each selected drug."
     try:
         rows = data.query(
             "SELECT hcpcs, any_value(drug_name) AS drug_name, hospital_key, "
@@ -855,11 +866,16 @@ def unit_validations(request):
             "FROM {cmp} WHERE status IN ('unit_unresolved','unit_ambiguous','billing_unit_mismatch','review_range') "
             "GROUP BY hcpcs, hospital_key ORDER BY status, hcpcs, hospital_label LIMIT 2000",
             cmp="comparison")
+        if not has_any_role(request.user, {ADMIN_GROUP}):
+            clinical_fields = ("hcpcs", "drug_name", "hospital_key", "hospital_label", "description",
+                               "drug_unit", "drug_unit_type", "billing_units", "unit_note", "status",
+                               "source_file", "source_sha256")
+            rows = [{key: row.get(key) for key in clinical_fields} for row in rows]
         return Response({"status": "loaded", "rows": rows, "total": len(rows),
-                         "review_workflow": "Admin must record an external clinical reviewer and evidence for each selected drug."})
+                         "review_workflow": review_workflow})
     except data.DataMissing as exc:
         return Response({"status": "blocked", "reason": str(exc), "rows": [], "total": 0,
-                         "review_workflow": "Admin must record an external clinical reviewer and evidence for each selected drug."})
+                         "review_workflow": review_workflow})
 
 
 @api_view(["GET"])

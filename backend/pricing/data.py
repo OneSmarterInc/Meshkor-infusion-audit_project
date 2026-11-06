@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import duckdb
@@ -59,7 +60,7 @@ _ASP_OLD_TO_NEW = {
 }
 
 
-def _asp_read_expr(path: str) -> str:
+def _asp_read_expr(path: str, source: str) -> str:
     """Return a Parquet expression with legacy ASP columns aliased canonically."""
     con = duckdb.connect()
     try:
@@ -74,22 +75,51 @@ def _asp_read_expr(path: str) -> str:
         for old, new in _ASP_OLD_TO_NEW.items()
         if old in old_cols and new not in cols
     )
-    escaped_path = path.replace("'", "''")
-    source = f"read_parquet('{escaped_path}')"
-    return f"(SELECT *, {aliases} FROM {source})" if aliases else source
+    parquet = f"read_parquet({source})"
+    return f"(SELECT *, {aliases} FROM {parquet})" if aliases else parquet
+
+
+_QUERY_BIND_TOKEN = re.compile(r"__pricing_parquet_[A-Za-z0-9_]+__|\?")
 
 
 def query(sql: str, params: list | None = None, **tables: str) -> list[dict]:
-    """Run SQL with Parquet table expressions; normalize legacy ASP columns."""
+    """Run SQL with parameter-bound Parquet scans; normalize legacy ASP columns."""
     if "comparison" in tables.values():
         require_current_scope()
     con = duckdb.connect()
     try:
-        sub = {}
-        for key, value in tables.items():
+        sub, scan_paths, materialized = {}, {}, []
+        for index, (key, value) in enumerate(tables.items()):
             path = _path(value)
-            sub[key] = _asp_read_expr(path) if value == "asp" else f"read_parquet('{path}')"
-        cur = con.execute(sql.format(**sub), params or [])
+            marker = f"__pricing_parquet_{index}__"
+            scan_paths[marker] = path
+            source = _asp_read_expr(path, marker) if value == "asp" else f"read_parquet({marker})"
+            if value == "comparison":
+                relation = f'"_pricing_parquet_{index}"'
+                materialized.append(f"{relation} AS MATERIALIZED (SELECT * FROM {source})")
+                sub[key] = relation
+            else:
+                sub[key] = source
+
+        values, value_index, bound = list(params or []), 0, []
+
+        def bind(match):
+            nonlocal value_index
+            token = match.group(0)
+            if token in scan_paths:
+                bound.append(scan_paths[token])
+            else:
+                if value_index >= len(values):
+                    return token
+                bound.append(values[value_index])
+                value_index += 1
+            return "?"
+
+        prefix = f"WITH {', '.join(materialized)} " if materialized else ""
+        statement = _QUERY_BIND_TOKEN.sub(bind, prefix + sql.format(**sub))
+        if value_index != len(values):
+            raise ValueError("SQL parameter count does not match the supplied parameters.")
+        cur = con.execute(statement, bound)
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
     finally:

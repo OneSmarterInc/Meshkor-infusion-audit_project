@@ -1,0 +1,12 @@
+claim_id,service_date,hcpcs_code,site_npi,units,allowed_amount,paid_amount,member_id,claim_status,plan_id,service_setting
+unresolved-1,2026-10-15,J1745,1000000004,1,90,70,unresolved-member-1,paid,RG01-SYNTHETIC-PLAN,outpatient_hospital
+unresolved-2,2026-10-15,J1745,1000000004,1,90,70,unresolved-member-2,paid,RG01-SYNTHETIC-PLAN,outpatient_hospital
+unresolved-3,2026-10-15,J1745,1000000004,1,90,70,unresolved-member-3,paid,RG01-SYNTHETIC-PLAN,outpatient_hospital
+unresolved-4,2026-10-15,J1745,1000000004,1,90,70,unresolved-member-4,paid,RG01-SYNTHETIC-PLAN,outpatient_hospital
+unresolved-5,2026-10-15,J1745,1000000004,1,90,70,unresolved-member-5,paid,RG01-SYNTHETIC-PLAN,outpatient_hospital
+unresolved-6,2026-10-15,J1745,1000000004,1,90,70,unresolved-member-6,paid,RG01-SYNTHETIC-PLAN,outpatient_hospital
+unresolved-7,2026-10-15,J1745,1000000004,1,90,70,unresolved-member-7,paid,RG01-SYNTHETIC-PLAN,outpatient_hospital
+unresolved-8,2026-10-15,J1745,1000000004,1,90,70,unresolved-member-8,paid,RG01-SYNTHETIC-PLAN,outpatient_hospital
+unresolved-9,2026-10-15,J1745,1000000004,1,90,70,unresolved-member-9,paid,RG01-SYNTHETIC-PLAN,outpatient_hospital
+unresolved-10,2026-10-15,J1745,1000000004,1,90,70,unresolved-member-10,paid,RG01-SYNTHETIC-PLAN,outpatient_hospital
+unresolved-11,2026-10-15,J1745,1000000004,1,90,70,unresolved-member-11,paid,RG01-SYNTHETIC-PLAN,outpatient_hospital

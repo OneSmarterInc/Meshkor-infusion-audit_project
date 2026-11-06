@@ -75,9 +75,9 @@ def organization_access(request, organization_id):
         user = get_user_model().objects.get(pk=int(request.data.get("user_id")),
                                             is_active=True, is_superuser=False)
     except (TypeError, ValueError, get_user_model().DoesNotExist):
-        return Response({"error": "A valid active Viewer user_id is required."}, status=400)
+        return Response({"error": "A valid active user_id is required."}, status=400)
     if not user.groups.filter(name__in=(CLIENT_GROUP, VIEWER_GROUP, ANALYST_GROUP, REVIEWER_GROUP)).exists():
-        return Response({"error": "Organization access can be granted only to an Analyst, Reviewer, or Client account."}, status=400)
+        return Response({"error": "Organization access can be granted only to an active Analyst, Reviewer, Client, or legacy Viewer account."}, status=400)
     access, created = PlanOrganizationAccess.objects.get_or_create(
         organization=organization, user=user, defaults={"granted_by": request.user})
     AuditEvent.objects.create(actor=request.user, action="plan_organization_viewer_access_granted",
@@ -200,7 +200,8 @@ def plan_network_roster(request, plan_id):
             from .plan_audit_engine import network_status_for
             roster = list(plan.network_roster.all())
             statuses = {}
-            for record in summary_import.records.values("site_npi", "quarter").distinct().iterator():
+            distinct_records = list(summary_import.records.values("site_npi", "quarter").distinct())
+            for record in distinct_records:
                 status = network_status_for(roster, record["site_npi"], record["quarter"])
                 statuses[status] = statuses.get(status, 0) + 1
             response["quarter_coverage"] = {

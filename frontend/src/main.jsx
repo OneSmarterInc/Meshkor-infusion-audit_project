@@ -74,7 +74,30 @@ function Landing({ onLogin }) {
         onLogin(result.user);
       }
     } catch (e) {
-      setError(e.message);
+      if (["challenge_expired", "challenge_invalid", "authentication_state_invalid"].includes(e.code)
+          && username && password) {
+        setOtpChallenge("");
+        setOtpCode("");
+        setRecoveryCode("");
+        try {
+          const fresh = await login(username, password);
+          if (fresh.otp_required) {
+            setOtpChallenge(fresh.challenge);
+            setError("Sign-in challenge renewed. Enter the current authenticator code.");
+          } else if (fresh.otp_setup_required) {
+            const enrollment = await startOtpEnrollment(fresh.challenge);
+            setOtpChallenge(fresh.challenge);
+            setOtpEnrollment(enrollment);
+            setError("");
+          } else if (fresh.user) {
+            onLogin(fresh.user);
+          }
+        } catch (renewError) {
+          setError(renewError.message);
+        }
+      } else {
+        setError(e.message);
+      }
       if (e.retryAfterSeconds) setLockoutSeconds(e.retryAfterSeconds);
     } finally {
       setBusy(false);
@@ -261,10 +284,13 @@ function App() {
   const [user, setUser] = useState(null);
   const [checking, setChecking] = useState(true);
   useEffect(() => {
+    const clearInvalidSession = () => setUser(null);
+    window.addEventListener("meshkor:session-expired", clearInvalidSession);
     restoreLogin()
       .then((result) => setUser(result.authenticated ? result.user : null))
       .catch(() => setUser(null))
       .finally(() => setChecking(false));
+    return () => window.removeEventListener("meshkor:session-expired", clearInvalidSession);
   }, []);
   async function signOut() {
     try { await logout(); } finally { setUser(null); }

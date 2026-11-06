@@ -10,7 +10,7 @@ from django.contrib.auth import authenticate, login, logout, password_validation
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.auth.hashers import check_password, make_password
-from django.core.exceptions import ImproperlyConfigured, ValidationError
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
 from django.core.cache import cache
 from django.core import signing
 from django.db import transaction
@@ -21,9 +21,10 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
-from rest_framework.authentication import SessionAuthentication
 from rest_framework.response import Response
 
+from .mfa import (mark_mfa_verified, mfa_claims_for_session,
+                  mfa_session_is_valid, revoke_mfa_session)
 from .models import AdminOTPDevice, AuditEvent, DrugUnitReview, ReportRecord
 from .otp import decrypt_secret, encrypt_secret, new_secret, provisioning_uri, verify_code
 from .permissions import (ADMIN_GROUP, VIEWER_GROUP, APPLICATION_ROLES, SUPER_ADMIN_GROUP,
@@ -47,13 +48,17 @@ def _user_payload(user):
     }
 
 
-def _access_token(user):
+def _access_token(request, user):
+    mfa_claims = mfa_claims_for_session(request.session, user)
+    if not mfa_claims:
+        raise PermissionDenied("Multi-factor authentication is required.")
     now = datetime.now(datetime_timezone.utc)
     return jwt.encode({
         "sub": str(user.pk),
         "iat": now,
         "exp": now + timedelta(seconds=settings.JWT_ACCESS_TOKEN_SECONDS),
         "type": "access",
+        **mfa_claims,
     }, settings.SECRET_KEY, algorithm="HS256")
 
 
@@ -63,6 +68,7 @@ def _attempt_key(username, ip):
 
 
 @api_view(["GET"])
+@authentication_classes([])
 @permission_classes([AllowAny])
 @ensure_csrf_cookie
 @never_cache
@@ -71,6 +77,7 @@ def csrf(request):
 
 
 @api_view(["POST"])
+@authentication_classes([])
 @permission_classes([AllowAny])
 @csrf_protect
 @never_cache
@@ -129,14 +136,15 @@ def admin_otp_status(request):
 
 
 @api_view(["POST"])
+@authentication_classes([])
 @permission_classes([AllowAny])
 @csrf_protect
 @never_cache
 def admin_otp_setup(request):
-    user = request.user if request.user.is_authenticated else _challenge_user(
-        request.data.get("challenge"), "enroll")
+    user = _challenge_user(request.data.get("challenge"), "enroll")
     if not user:
-        return Response({"error": "This authenticator setup challenge expired. Sign in again."}, status=401)
+        return Response({"error": "This authenticator setup challenge expired. Sign in again.",
+                         "code": "challenge_expired"}, status=401)
     if not has_any_role(user, set(APPLICATION_ROLES) | {ADMIN_GROUP, VIEWER_GROUP}):
         return Response({"error": "This account has no application role."}, status=403)
     device = AdminOTPDevice.objects.filter(user=user).first()
@@ -161,15 +169,16 @@ def admin_otp_setup(request):
 
 
 @api_view(["POST"])
+@authentication_classes([])
 @permission_classes([AllowAny])
 @csrf_protect
 @transaction.atomic
 @never_cache
 def admin_otp_confirm(request):
-    user = request.user if request.user.is_authenticated else _challenge_user(
-        request.data.get("challenge"), "enroll")
+    user = _challenge_user(request.data.get("challenge"), "enroll")
     if not user:
-        return Response({"error": "This authenticator setup challenge expired. Sign in again."}, status=401)
+        return Response({"error": "This authenticator setup challenge expired. Sign in again.",
+                         "code": "challenge_expired"}, status=401)
     if not has_any_role(user, set(APPLICATION_ROLES) | {ADMIN_GROUP, VIEWER_GROUP}):
         return Response({"error": "This account has no application role."}, status=403)
     challenge = str(request.data.get("challenge", ""))
@@ -197,12 +206,12 @@ def admin_otp_confirm(request):
     AuditEvent.objects.create(actor=user, action="otp_enabled",
                               entity_type="user", entity_id=str(user.pk))
     response = {"enabled": True, "recovery_codes": recovery_codes}
-    if not request.user.is_authenticated:
-        login(request, user)
-        response.update({"user": _user_payload(user), "access": _access_token(user),
-                         "token_type": "Bearer", "expires_in": settings.JWT_ACCESS_TOKEN_SECONDS})
-        AuditEvent.objects.create(actor=user, action="login_succeeded", entity_type="user",
-                                  entity_id=str(user.pk), details={"otp": "enrollment"})
+    login(request, user)
+    mark_mfa_verified(request.session, user, device)
+    response.update({"user": _user_payload(user), "access": _access_token(request, user),
+                     "token_type": "Bearer", "expires_in": settings.JWT_ACCESS_TOKEN_SECONDS})
+    AuditEvent.objects.create(actor=user, action="login_succeeded", entity_type="user",
+                              entity_id=str(user.pk), details={"otp": "enrollment"})
     return Response(response)
 
 
@@ -224,6 +233,7 @@ def _challenge_user(challenge, purpose):
 
 
 @api_view(["POST"])
+@authentication_classes([])
 @permission_classes([AllowAny])
 @csrf_protect
 @never_cache
@@ -237,16 +247,20 @@ def complete_otp_login(request):
     try:
         payload = signing.loads(challenge, salt="user-otp-login", max_age=300)
     except (signing.BadSignature, signing.SignatureExpired):
-        return Response({"error": "This sign-in challenge expired. Enter your password again."}, status=401)
+        return Response({"error": "This sign-in challenge expired. Enter your password again.",
+                         "code": "challenge_expired"}, status=401)
     if payload.get("purpose") != "login":
-        return Response({"error": "This sign-in challenge is invalid. Enter your password again."}, status=401)
+        return Response({"error": "This sign-in challenge is invalid. Enter your password again.",
+                         "code": "challenge_invalid"}, status=401)
     user = get_user_model().objects.filter(pk=payload.get("user_id"), is_active=True).first()
     if not user or not has_any_role(user, set(APPLICATION_ROLES) | {ADMIN_GROUP, VIEWER_GROUP}):
-        return Response({"error": "This authenticator sign-in is no longer valid. Enter your password again."}, status=401)
+        return Response({"error": "This authenticator sign-in is no longer valid. Enter your password again.",
+                         "code": "authentication_state_invalid"}, status=401)
     with transaction.atomic():
         device = AdminOTPDevice.objects.select_for_update().filter(user=user, enabled=True).first()
         if not device:
-            return Response({"error": "This authenticator sign-in is no longer valid. Enter your password again."}, status=401)
+            return Response({"error": "This authenticator sign-in is no longer valid. Enter your password again.",
+                             "code": "authentication_state_invalid"}, status=401)
         step = verify_code(decrypt_secret(device.secret), request.data.get("code"))
         recovery_hash_index = None
         supplied_recovery = str(request.data.get("recovery_code", "")).strip().upper()
@@ -272,19 +286,19 @@ def complete_otp_login(request):
             auth_method = "totp"
     cache.delete(attempt_key)
     login(request, user)
+    mark_mfa_verified(request.session, user, device)
     AuditEvent.objects.create(actor=user, action="login_succeeded", entity_type="user",
                               entity_id=str(user.pk), details={"otp": auth_method})
-    return Response({"user": _user_payload(user), "access": _access_token(user),
+    return Response({"user": _user_payload(user), "access": _access_token(request, user),
                      "token_type": "Bearer", "expires_in": settings.JWT_ACCESS_TOKEN_SECONDS})
 
 
 @api_view(["POST"])
-@authentication_classes([SessionAuthentication])
 @permission_classes([IsAuthenticated])
 @never_cache
 def refresh_access(request):
     """Issue a short-lived JWT using the existing HttpOnly Django login session."""
-    return Response({"access": _access_token(request.user), "token_type": "Bearer",
+    return Response({"access": _access_token(request, request.user), "token_type": "Bearer",
                      "expires_in": settings.JWT_ACCESS_TOKEN_SECONDS})
 
 
@@ -292,8 +306,16 @@ def refresh_access(request):
 @permission_classes([IsAuthenticated])
 def logout_view(request):
     user = request.user
+    claims = request.auth if isinstance(request.auth, dict) else None
+    if claims is not None:
+        if (str(claims.get("sub")) != str(user.pk)
+                or not revoke_mfa_session(user, claims.get("sid"), claims.get("mfa_at"))):
+            return Response({"error": "The authenticated session could not be revoked."}, status=401)
+    # A bearer token can accompany a different user's cookie. Flush only a
+    # cookie session whose MFA evidence is bound to the authenticated user.
+    if mfa_session_is_valid(request.session, user):
+        logout(request)
     AuditEvent.objects.create(actor=user, action="logout", entity_type="user", entity_id=str(user.pk))
-    logout(request)
     return Response({"ok": True})
 
 

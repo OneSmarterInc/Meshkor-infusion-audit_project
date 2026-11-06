@@ -1,4 +1,5 @@
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
 
 
@@ -252,6 +253,8 @@ class PlanAudit(models.Model):
     completed_at = models.DateTimeField(null=True, blank=True)
     report_generated_at = models.DateTimeField(null=True, blank=True)
     summary = models.JSONField(default=dict, blank=True)
+    current_version = models.PositiveIntegerField(default=0)
+    published_version = models.PositiveIntegerField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -259,9 +262,128 @@ class PlanAudit(models.Model):
                                 name="audit_org_plan_status_ix")]
 
 
-class PlanAuditResult(models.Model):
+class PlanAuditRun(models.Model):
+    CALCULATION_STATUSES = [
+        ("running", "Running"), ("completed", "Completed"),
+        ("failed", "Failed"), ("legacy_unverified", "Legacy unverified"),
+    ]
+    PUBLICATION_STATUSES = [
+        ("pending", "Pending approval"), ("published", "Published"),
+        ("rejected", "Rejected"), ("revoked", "Revoked"),
+        ("unverified", "Legacy unverified"), ("failed", "Calculation failed"),
+    ]
+
+    plan_audit = models.ForeignKey(PlanAudit, on_delete=models.PROTECT, related_name="runs")
+    version = models.PositiveIntegerField()
+    calculation_status = models.CharField(max_length=24, choices=CALCULATION_STATUSES)
+    publication_status = models.CharField(max_length=16, choices=PUBLICATION_STATUSES, default="pending")
+    summary_import = models.ForeignKey(ClaimsSummaryImport, on_delete=models.PROTECT,
+                                      related_name="audit_runs")
+    source_sha256 = models.CharField(max_length=64, blank=True)
+    reference_fingerprints = models.JSONField(default=dict, blank=True)
+    calculation_fingerprint = models.CharField(max_length=64, blank=True)
+    result_fingerprint = models.CharField(max_length=64, blank=True)
+    report_fingerprint = models.CharField(max_length=64, blank=True)
+    initiated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL,
+                                     related_name="plan_audit_runs_initiated")
+    approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
+                                    on_delete=models.SET_NULL, related_name="plan_audit_runs_approved")
+    review_status = models.CharField(max_length=16, default="pending")
+    approved_at = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField()
+    completed_at = models.DateTimeField(null=True, blank=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    revocation_reason = models.CharField(max_length=240, blank=True)
+
+    class Meta:
+        ordering = ["-version"]
+        constraints = [models.UniqueConstraint(fields=["plan_audit", "version"],
+                                                name="plan_audit_run_version_unique")]
+
+
+class PlanAuditArtifact(models.Model):
+    ARTIFACT_TYPES = [("pdf", "PDF report"), ("csv", "Results CSV")]
+
+    audit_run = models.ForeignKey(PlanAuditRun, on_delete=models.PROTECT, related_name="artifacts")
+    artifact_type = models.CharField(max_length=8, choices=ARTIFACT_TYPES)
+    content = models.BinaryField()
+    sha256 = models.CharField(max_length=64)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["audit_run", "artifact_type"],
+                                                name="plan_audit_run_artifact_unique")]
+
+
+class ImmutableAuditRunQuerySet(models.QuerySet):
+    """Permit result writes only while the owning calculation is running."""
+
+    def _assert_run_is_writable(self):
+        if self.exclude(audit_run__calculation_status="running").exists():
+            raise ValidationError("Audit run results are immutable after calculation completes.")
+
+    def update(self, **kwargs):
+        self._assert_run_is_writable()
+        return super().update(**kwargs)
+
+    def delete(self):
+        self._assert_run_is_writable()
+        return super().delete()
+
+    def bulk_create(self, objs, **kwargs):
+        objs = list(objs)
+        if not objs:
+            return super().bulk_create(objs, **kwargs)
+        run_ids = {obj.audit_run_id for obj in objs}
+        if (None in run_ids or not run_ids
+                or PlanAuditRun.objects.filter(
+                    pk__in=run_ids, calculation_status="running").count() != len(run_ids)):
+            raise ValidationError("Results may only be created for an active audit run.")
+        return super().bulk_create(objs, **kwargs)
+
+
+class ImmutableAuditRunManager(models.Manager.from_queryset(ImmutableAuditRunQuerySet)):
+    pass
+
+
+class ImmutableAuditRunRow(models.Model):
+    """Instance-level guard paired with the queryset guard for result snapshots."""
+
+    objects = ImmutableAuditRunManager()
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        if not PlanAuditRun.objects.filter(
+                pk=self.audit_run_id, calculation_status="running").exists():
+            raise ValidationError("Audit run results may only be saved while calculation is running.")
+        if self.pk:
+            prior_run_id = type(self)._base_manager.filter(pk=self.pk).values_list(
+                "audit_run_id", flat=True).first()
+            if prior_run_id and not PlanAuditRun.objects.filter(
+                    pk=prior_run_id, calculation_status="running").exists():
+                raise ValidationError("Completed audit run results are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        prior_run_id = type(self)._base_manager.filter(pk=self.pk).values_list(
+            "audit_run_id", flat=True).first() if self.pk else self.audit_run_id
+        if (not PlanAuditRun.objects.filter(
+                pk=self.audit_run_id, calculation_status="running").exists()
+                or (prior_run_id and not PlanAuditRun.objects.filter(
+                    pk=prior_run_id, calculation_status="running").exists())):
+            raise ValidationError("Completed audit run results cannot be deleted.")
+        return super().delete(*args, **kwargs)
+
+
+class PlanAuditResult(ImmutableAuditRunRow):
     """Reproducible comparison outputs derived from approved summary and reference data."""
     plan_audit = models.ForeignKey(PlanAudit, on_delete=models.CASCADE, related_name="results")
+    audit_run = models.ForeignKey(PlanAuditRun, on_delete=models.PROTECT,
+                                  related_name="results")
     summary_record = models.ForeignKey(ClaimsSummaryRecord, on_delete=models.PROTECT,
                                        related_name="audit_results")
     hcpcs_code = models.CharField(max_length=5, db_index=True)
@@ -290,14 +412,14 @@ class PlanAuditResult(models.Model):
     class Meta:
         ordering = ["quarter", "hcpcs_code", "site_npi"]
         constraints = [models.UniqueConstraint(
-            fields=["plan_audit", "hcpcs_code", "site_npi", "quarter", "service_setting"],
-            name="plan_audit_result_group_unique",
+            fields=["audit_run", "hcpcs_code", "site_npi", "quarter", "service_setting"],
+            name="plan_audit_result_run_group_unique",
         )]
         indexes = [models.Index(fields=["plan_audit", "data_quality_status"],
                                 name="audit_result_quality_ix")]
 
 
-class SavingsOpportunity(models.Model):
+class SavingsOpportunity(ImmutableAuditRunRow):
     NETWORK_STATUSES = [("IN_NETWORK", "In network"), ("OUT_OF_NETWORK", "Out of network"),
                         ("NETWORK_STATUS_UNKNOWN", "Network status unknown"),
                         ("NETWORK_DATA_EXPIRED", "Network data expired")]
@@ -305,6 +427,8 @@ class SavingsOpportunity(models.Model):
                            ("not_actionable", "Not actionable")]
 
     plan_audit = models.ForeignKey(PlanAudit, on_delete=models.CASCADE, related_name="savings_opportunities")
+    audit_run = models.ForeignKey(PlanAuditRun, on_delete=models.PROTECT,
+                                  related_name="savings_opportunities")
     hcpcs_code = models.CharField(max_length=5, db_index=True)
     quarter = models.CharField(max_length=6)
     service_setting = models.CharField(max_length=80, blank=True)
@@ -324,9 +448,9 @@ class SavingsOpportunity(models.Model):
     class Meta:
         ordering = ["-potential_allowed_savings"]
         constraints = [
-            models.UniqueConstraint(fields=["plan_audit", "hcpcs_code", "quarter", "service_setting",
+            models.UniqueConstraint(fields=["audit_run", "hcpcs_code", "quarter", "service_setting",
                                             "current_site_npi", "alternative_site_npi"],
-                                    name="savings_opportunity_unique"),
+                                    name="savings_run_opportunity_unique"),
             models.CheckConstraint(condition=models.Q(potential_allowed_savings__gte=0),
                                    name="savings_nonnegative"),
         ]
@@ -336,6 +460,8 @@ class AuditReview(models.Model):
     STATUSES = [("submitted", "Submitted"), ("approved", "Approved"), ("rejected", "Rejected")]
 
     plan_audit = models.ForeignKey(PlanAudit, on_delete=models.CASCADE, related_name="reviews")
+    audit_run = models.ForeignKey(PlanAuditRun, on_delete=models.PROTECT,
+                                  related_name="reviews")
     reviewer = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL,
                                  related_name="plan_audit_reviews")
     review_status = models.CharField(max_length=16, choices=STATUSES, default="submitted")

@@ -1,16 +1,23 @@
 """Run and inspect plan-specific audit comparisons."""
 import logging
+import hashlib
+import json
 from collections import defaultdict
 from decimal import Decimal
+from pathlib import Path
 
 from django.db import transaction
 from django.utils import timezone
+from django.conf import settings
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
-from .models import AuditEvent, PlanAudit, PlanAuditResult, SavingsOpportunity
+from .models import AuditEvent, PlanAudit, PlanAuditResult, PlanAuditRun, SavingsOpportunity
 from .permissions import CanAnalyze, CanView
-from .plan_audit_common import audit_payload, get_visible_audit
+from .plan_audit_common import (
+    audit_payload, current_audit_run, get_visible_audit, run_opportunities,
+    is_client_only, run_results, run_result_fingerprint,
+)
 from .plan_audit_engine import run_plan_audit
 
 # Allow-listed sort fields for historical spending queries
@@ -55,12 +62,18 @@ def result_payload(item):
     }
 
 
-def _visible_totals(audit):
-    results = list(audit.results.all())
+def _visible_totals(audit, run=None, *, include_unvalidated_savings=True):
+    run = run or current_audit_run(audit)
+    results = list(run_results(run))
     allowed = sum((row.total_allowed_amount for row in results), Decimal(0))
     paid = sum((row.total_paid_amount for row in results), Decimal(0))
     units = sum((row.total_units for row in results), Decimal(0))
-    opportunities = list(audit.savings_opportunities.all())
+    opportunities_query = run_opportunities(run)
+    if not include_unvalidated_savings:
+        opportunities_query = opportunities_query.filter(
+            validation_status="validated", clinical_review_status__in=("approved", "validated"),
+        )
+    opportunities = list(opportunities_query)
     savings = sum((row.potential_allowed_savings for row in opportunities), Decimal(0))
     return {
         "drugs_analyzed": len({row.hcpcs_code for row in results}),
@@ -75,10 +88,45 @@ def _visible_totals(audit):
     }
 
 
+def _calculation_fingerprint():
+    project = settings.BASE_DIR.parent
+    paths = (
+        Path(__file__).with_name("plan_audit_engine.py"),
+        Path(__file__).with_name("plan_audit_run.py"),
+        project / "config" / "hospital_sites.csv",
+        project / "config" / "drugs_in_scope.yaml",
+        project / "config" / "pipeline.yaml",
+    )
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.name.encode("utf-8"))
+        if path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _run_reference_fingerprints(run):
+    collected = defaultdict(set)
+    for references in run_results(run).values_list("source_references", flat=True).iterator():
+        for key, value in references.items():
+            if value not in (None, "", []):
+                if isinstance(value, list):
+                    collected[key].update(str(item) for item in value)
+                else:
+                    collected[key].add(str(value))
+    fingerprints = {}
+    for key, values in sorted(collected.items()):
+        ordered = sorted(values)
+        canonical = json.dumps(ordered, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        fingerprints[key] = {"values": ordered, "sha256": hashlib.sha256(canonical).hexdigest()}
+    return fingerprints
+
+
 @api_view(["POST"])
 @permission_classes([CanAnalyze])
 def run_audit(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
+    run = None
     try:
         with transaction.atomic():
             audit = PlanAudit.objects.select_for_update().select_related(
@@ -86,31 +134,81 @@ def run_audit(request, audit_id):
             ).get(pk=audit.pk)
             if audit.summary_import.import_status != "accepted":
                 return Response({"error": "The selected summary import is not accepted."}, status=409)
+            if audit.status == "running" or audit.runs.filter(calculation_status="running").exists():
+                return Response({"error": "An audit run is already in progress."}, status=409)
+            now = timezone.now()
+            previous = current_audit_run(audit)
+            if previous and previous.publication_status in {"pending", "published"}:
+                was_published = previous.publication_status == "published"
+                previous.publication_status = "revoked"
+                previous.revoked_at = now
+                previous.revocation_reason = "A newer calculation run has started."
+                previous.save(update_fields=["publication_status", "revoked_at", "revocation_reason"])
+                if was_published:
+                    AuditEvent.objects.create(
+                        actor=request.user, action="plan_audit_publication_revoked",
+                        entity_type="plan_audit", entity_id=str(audit.pk),
+                        details={"version": previous.version, "reason": previous.revocation_reason},
+                    )
+            latest_version = audit.runs.order_by("-version").values_list("version", flat=True).first() or 0
+            version = latest_version + 1
+            run = PlanAuditRun.objects.create(
+                plan_audit=audit, version=version, calculation_status="running",
+                publication_status="pending", summary_import=audit.summary_import,
+                source_sha256=audit.summary_import.file_hash, initiated_by=request.user,
+                started_at=now, calculation_fingerprint=_calculation_fingerprint(),
+            )
             audit.status = "running"
             audit.summary = {}
-            audit.save(update_fields=["status", "summary"])
-            audit.results.all().delete()
-            audit.savings_opportunities.all().delete()
-            summary = run_plan_audit(audit)
+            audit.current_version = version
+            audit.published_version = None
+            audit.completed_at = None
+            audit.report_generated_at = None
+            audit.save(update_fields=["status", "summary", "current_version", "published_version",
+                                      "completed_at", "report_generated_at"])
+            AuditEvent.objects.create(
+                actor=request.user, action="plan_audit_run_started",
+                entity_type="plan_audit", entity_id=str(audit.pk),
+                details={"version": version, "source_sha256": run.source_sha256},
+            )
+        with transaction.atomic():
+            summary = run_plan_audit(audit, run)
+            run.reference_fingerprints = _run_reference_fingerprints(run)
+            run.result_fingerprint = run_result_fingerprint(run)
+            run.calculation_status = "completed"
+            run.completed_at = timezone.now()
+            run.save(update_fields=["reference_fingerprints", "result_fingerprint",
+                                    "calculation_status", "completed_at"])
             audit.summary = summary
             has_warnings = any(status != "VALID" for status in summary["quality_status_counts"])
             audit.status = "needs_review" if has_warnings else "completed"
-            audit.completed_at = timezone.now()
+            audit.completed_at = run.completed_at
             audit.save(update_fields=["summary", "status", "completed_at"])
             AuditEvent.objects.create(
                 actor=request.user, action="plan_audit_run_completed",
                 entity_type="plan_audit", entity_id=str(audit.pk),
-                details={"result_rows": summary["result_rows"],
+                details={"version": run.version, "result_fingerprint": run.result_fingerprint,
+                         "result_rows": summary["result_rows"],
                          "savings_opportunities": summary["savings_opportunities"],
                          "status": audit.status},
             )
     except Exception:
         logger.exception("Plan audit execution failed for audit id %s.", audit.pk)
-        PlanAudit.objects.filter(pk=audit.pk).update(
-            status="failed", summary={"error": "Audit execution failed; no result details were stored."})
+        with transaction.atomic():
+            PlanAudit.objects.filter(pk=audit.pk).update(
+                status="failed", summary={"error": "Audit execution failed; no result details were stored."})
+            if run:
+                PlanAuditRun.objects.filter(pk=run.pk).update(
+                    calculation_status="failed", publication_status="failed",
+                    completed_at=timezone.now())
+                AuditEvent.objects.create(
+                    actor=request.user, action="plan_audit_run_failed",
+                    entity_type="plan_audit", entity_id=str(audit.pk),
+                    details={"version": run.version},
+                )
         return Response({"error": "Audit execution failed. Check reference-data availability and server logs."},
                         status=500)
-    return Response(audit_payload(audit))
+    return Response(audit_payload(audit, request.user))
 
 
 @api_view(["GET"])
@@ -122,7 +220,7 @@ def audit_results(request, audit_id):
         offset = max(int(request.query_params.get("offset", 0)), 0)
     except (TypeError, ValueError):
         return Response({"error": "limit and offset must be whole numbers."}, status=400)
-    queryset = audit.results.all()
+    queryset = run_results(current_audit_run(audit))
     if request.query_params.get("hcpcs_code"):
         queryset = queryset.filter(hcpcs_code=request.query_params["hcpcs_code"].upper())
     if request.query_params.get("quarter"):
@@ -141,10 +239,9 @@ def drug_analysis(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
     grouped = defaultdict(lambda: {
         "units": Decimal(0), "allowed": Decimal(0), "paid": Decimal(0),
-        "asp": set(), "allowed_multiple": [], "paid_multiple": [],
-        "qualities": defaultdict(int), "sites": set(), "quarters": set(),
+        "qualities": defaultdict(int), "sites": set(), "quarters": set(), "rows": [],
     })
-    for row in audit.results.all():
+    for row in run_results(current_audit_run(audit)):
         item = grouped[row.hcpcs_code]
         item["units"] += row.total_units
         item["allowed"] += row.total_allowed_amount
@@ -152,30 +249,191 @@ def drug_analysis(request, audit_id):
         item["sites"].add(row.site_npi)
         item["quarters"].add(row.quarter)
         item["qualities"][row.data_quality_status] += 1
-        if row.asp_payment_limit is not None:
-            item["asp"].add(row.asp_payment_limit)
-        if row.allowed_markup_multiple is not None:
-            item["allowed_multiple"].append(row.allowed_markup_multiple)
-        if row.paid_markup_multiple is not None:
-            item["paid_multiple"].append(row.paid_markup_multiple)
+        item["rows"].append(row)
+
+    def exclusion_reason(row, metric):
+        refs = row.source_references or {}
+        blocking_quality = {"UNIT_UNRESOLVED", "UNIT_AMBIGUOUS", "BILLING_UNIT_MISMATCH"}
+        if (row.data_quality_status in blocking_quality
+                or blocking_quality.intersection(row.data_quality_notes or [])
+                or refs.get("unit_review_status") != "validated"):
+            return "unit_not_validated"
+        hashes = (refs.get("unit_review_source_sha256"), refs.get("drug_selection_source_sha256"))
+        if any(not isinstance(value, str) or len(value) != 64
+               or any(char not in "0123456789abcdef" for char in value.lower()) for value in hashes):
+            return "unit_review_source_unverified"
+        quarter = str(row.quarter or "")
+        if (len(quarter) != 6 or not quarter[:4].isdigit()
+                or quarter[4] != "Q" or quarter[5] not in "1234"):
+            return "benchmark_quarter_invalid"
+        try:
+            units = Decimal(row.total_units)
+            benchmark = Decimal(row.asp_payment_limit) if row.asp_payment_limit is not None else None
+            numerator = Decimal(row.total_allowed_amount if metric == "allowed" else row.total_paid_amount)
+            detail = getattr(row, f"{metric}_markup_multiple")
+            detail = Decimal(detail) if detail is not None else None
+        except (ArithmeticError, TypeError, ValueError):
+            return "invalid_benchmark_inputs"
+        if (not units.is_finite() or units <= 0 or not numerator.is_finite() or numerator < 0):
+            return "invalid_benchmark_inputs"
+        if benchmark is None or not benchmark.is_finite() or benchmark <= 0:
+            return "asp_missing_or_nonpositive"
+        asp_hash = refs.get("asp_source_sha256")
+        if (not isinstance(asp_hash, str) or len(asp_hash) != 64
+                or any(char not in "0123456789abcdef" for char in asp_hash.lower())):
+            return "benchmark_source_unverified"
+        if detail is None or not detail.is_finite() or detail < 0:
+            return "detailed_markup_unavailable"
+        return None
+
     result = []
     for code, item in sorted(grouped.items()):
         allowed_unit = item["allowed"] / item["units"] if item["units"] else None
         paid_unit = item["paid"] / item["units"] if item["units"] else None
-        asp = next(iter(item["asp"])) if len(item["asp"]) == 1 else None
-        allowed_markup = allowed_unit / asp if asp else None
-        paid_markup = paid_unit / asp if asp else None
+        by_quarter = defaultdict(list)
+        for row in item["rows"]:
+            by_quarter[row.quarter].append(row)
+        quarter_results = {}
+        eligible_allowed_rows, eligible_paid_rows = set(), set()
+        excluded_allowed_amount = Decimal(0)
+        excluded_paid_amount = Decimal(0)
+        excluded_total_units = Decimal(0)
+        excluded_row_count = 0
+        exclusion_counts = defaultdict(int)
+        for quarter in sorted(by_quarter):
+            rows = by_quarter[quarter]
+            reasons = {row.pk: {
+                "allowed": exclusion_reason(row, "allowed"),
+                "paid": exclusion_reason(row, "paid"),
+            } for row in rows}
+            candidates = [row for row in rows if any(reason is None for reason in reasons[row.pk].values())]
+            signatures = {
+                (row.asp_payment_limit, (row.source_references or {}).get("asp_source_sha256"),
+                 (row.source_references or {}).get("unit_review_source_sha256"),
+                 (row.source_references or {}).get("unit_review_billing_qty"),
+                 (row.source_references or {}).get("unit_review_billing_unit"),
+                 (row.source_references or {}).get("drug_selection_source_sha256"))
+                for row in candidates
+            }
+            mixed_basis = len(signatures) > 1
+            if mixed_basis:
+                for row in candidates:
+                    reasons[row.pk]["allowed"] = "mixed_quarter_benchmark_or_unit_evidence"
+                    reasons[row.pk]["paid"] = "mixed_quarter_benchmark_or_unit_evidence"
+
+            eligible_allowed = [row for row in rows if reasons[row.pk]["allowed"] is None]
+            eligible_paid = [row for row in rows if reasons[row.pk]["paid"] is None]
+            eligible_allowed_rows.update(row.pk for row in eligible_allowed)
+            eligible_paid_rows.update(row.pk for row in eligible_paid)
+            allowed_benchmark_amount = sum(
+                (Decimal(row.total_units) * Decimal(row.asp_payment_limit) for row in eligible_allowed), Decimal(0))
+            paid_benchmark_amount = sum(
+                (Decimal(row.total_units) * Decimal(row.asp_payment_limit) for row in eligible_paid), Decimal(0))
+            allowed_numerator = sum((Decimal(row.total_allowed_amount) for row in eligible_allowed), Decimal(0))
+            paid_numerator = sum((Decimal(row.total_paid_amount) for row in eligible_paid), Decimal(0))
+            eligible_both = {row.pk for row in eligible_allowed} & {row.pk for row in eligible_paid}
+            excluded_any = [row for row in rows if row not in eligible_allowed or row not in eligible_paid]
+            q_excluded_units = sum((Decimal(row.total_units) for row in excluded_any), Decimal(0))
+            q_excluded_allowed = sum((Decimal(row.total_allowed_amount) for row in rows
+                                      if reasons[row.pk]["allowed"] is not None), Decimal(0))
+            q_excluded_paid = sum((Decimal(row.total_paid_amount) for row in rows
+                                   if reasons[row.pk]["paid"] is not None), Decimal(0))
+            q_eligible_allowed_units = sum((Decimal(row.total_units) for row in eligible_allowed), Decimal(0))
+            q_eligible_paid_units = sum((Decimal(row.total_units) for row in eligible_paid), Decimal(0))
+            q_excluded_allowed_units = sum((Decimal(row.total_units) for row in rows
+                                            if reasons[row.pk]["allowed"] is not None), Decimal(0))
+            q_excluded_paid_units = sum((Decimal(row.total_units) for row in rows
+                                         if reasons[row.pk]["paid"] is not None), Decimal(0))
+            for row in excluded_any:
+                excluded_row_count += 1
+                row_reasons = {reason for reason in reasons[row.pk].values() if reason}
+                for reason in row_reasons:
+                    exclusion_counts[reason] += 1
+            excluded_total_units += q_excluded_units
+            excluded_allowed_amount += q_excluded_allowed
+            excluded_paid_amount += q_excluded_paid
+            quarter_asp_values = sorted({Decimal(row.asp_payment_limit) for row in eligible_allowed + eligible_paid})
+            quarter_asp = quarter_asp_values[0] if len(quarter_asp_values) == 1 else None
+            quarter_results[quarter] = {
+                "eligible_row_count": len(eligible_both),
+                "eligible_allowed_row_count": len(eligible_allowed),
+                "eligible_paid_row_count": len(eligible_paid),
+                "excluded_row_count": len(excluded_any),
+                "visible_total_units": _decimal_text(sum((Decimal(row.total_units) for row in rows), Decimal(0))),
+                "visible_allowed_amount": _decimal_text(sum((Decimal(row.total_allowed_amount) for row in rows), Decimal(0))),
+                "visible_paid_amount": _decimal_text(sum((Decimal(row.total_paid_amount) for row in rows), Decimal(0))),
+                "eligible_total_units": _decimal_text(sum((Decimal(row.total_units) for row in rows
+                                                           if row.pk in eligible_both), Decimal(0))),
+                "eligible_allowed_amount": _decimal_text(allowed_numerator),
+                "eligible_paid_amount": _decimal_text(paid_numerator),
+                "eligible_allowed_units": _decimal_text(q_eligible_allowed_units),
+                "eligible_paid_units": _decimal_text(q_eligible_paid_units),
+                "excluded_allowed_amount": _decimal_text(q_excluded_allowed),
+                "excluded_paid_amount": _decimal_text(q_excluded_paid),
+                "excluded_allowed_units": _decimal_text(q_excluded_allowed_units),
+                "excluded_paid_units": _decimal_text(q_excluded_paid_units),
+                "excluded_total_units": _decimal_text(q_excluded_units),
+                "asp_payment_limit": _decimal_text(quarter_asp),
+                "allowed_markup_multiple": _decimal_text(
+                    allowed_numerator / allowed_benchmark_amount if allowed_benchmark_amount else None),
+                "paid_markup_multiple": _decimal_text(
+                    paid_numerator / paid_benchmark_amount if paid_benchmark_amount else None),
+                "comparison_status": "not_comparable" if mixed_basis or not eligible_allowed and not eligible_paid
+                                     else "comparable",
+            }
+        allowed_numerator = sum((Decimal(row.total_allowed_amount) for row in item["rows"]
+                                 if row.pk in eligible_allowed_rows), Decimal(0))
+        paid_numerator = sum((Decimal(row.total_paid_amount) for row in item["rows"]
+                              if row.pk in eligible_paid_rows), Decimal(0))
+        allowed_benchmark_amount = sum((Decimal(row.total_units) * Decimal(row.asp_payment_limit)
+                                        for row in item["rows"] if row.pk in eligible_allowed_rows), Decimal(0))
+        paid_benchmark_amount = sum((Decimal(row.total_units) * Decimal(row.asp_payment_limit)
+                                     for row in item["rows"] if row.pk in eligible_paid_rows), Decimal(0))
+        eligible_total_units = sum((Decimal(row.total_units) for row in item["rows"]
+                                    if row.pk in (eligible_allowed_rows & eligible_paid_rows)), Decimal(0))
+        eligible_allowed_units = sum((Decimal(row.total_units) for row in item["rows"]
+                                      if row.pk in eligible_allowed_rows), Decimal(0))
+        eligible_paid_units = sum((Decimal(row.total_units) for row in item["rows"]
+                                   if row.pk in eligible_paid_rows), Decimal(0))
+        excluded_allowed_units = item["units"] - eligible_allowed_units
+        excluded_paid_units = item["units"] - eligible_paid_units
+        single_quarter = len(item["quarters"]) == 1
+        allowed_markup = (allowed_numerator / allowed_benchmark_amount
+                          if single_quarter and allowed_benchmark_amount else None)
+        paid_markup = (paid_numerator / paid_benchmark_amount
+                       if single_quarter and paid_benchmark_amount else None)
+        only_quarter = sorted(item["quarters"])[0] if single_quarter else None
+        eligible_quarter = quarter_results.get(only_quarter) if only_quarter else None
         result.append({
             "hcpcs_code": code, "total_units": _decimal_text(item["units"]),
             "visible_allowed_amount": _decimal_text(item["allowed"]),
             "visible_paid_amount": _decimal_text(item["paid"]),
             "allowed_price_per_unit": _decimal_text(allowed_unit),
             "paid_price_per_unit": _decimal_text(paid_unit),
-            "asp_payment_limit": _decimal_text(asp),
+            "asp_payment_limit": eligible_quarter["asp_payment_limit"] if eligible_quarter else None,
             "allowed_markup_multiple": _decimal_text(allowed_markup),
             "paid_markup_multiple": _decimal_text(paid_markup),
             "hospitals": len(item["sites"]), "quarters": sorted(item["quarters"]),
             "data_quality_status_counts": dict(item["qualities"]),
+            "quarter_breakdown": quarter_results,
+            "benchmark_comparison_status": ("not_comparable" if not eligible_allowed_rows and not eligible_paid_rows
+                                             else "single_quarter" if single_quarter else "quarter_specific_only"),
+            "eligible_row_count": len(eligible_allowed_rows & eligible_paid_rows),
+            "eligible_allowed_row_count": len(eligible_allowed_rows),
+            "eligible_paid_row_count": len(eligible_paid_rows),
+            "eligible_allowed_amount": _decimal_text(allowed_numerator),
+            "eligible_paid_amount": _decimal_text(paid_numerator),
+            "eligible_total_units": _decimal_text(eligible_total_units),
+            "eligible_allowed_units": _decimal_text(eligible_allowed_units),
+            "eligible_paid_units": _decimal_text(eligible_paid_units),
+            "excluded_row_count": excluded_row_count,
+            "excluded_allowed_amount": _decimal_text(excluded_allowed_amount),
+            "excluded_paid_amount": _decimal_text(excluded_paid_amount),
+            "excluded_total_units": _decimal_text(excluded_total_units),
+            "excluded_allowed_units": _decimal_text(excluded_allowed_units),
+            "excluded_paid_units": _decimal_text(excluded_paid_units),
+            "benchmark_exclusion_reason_counts": dict(sorted(exclusion_counts.items())),
+            "markup_aggregation": "eligible amount divided by eligible units times each matching ASP; multi-quarter totals are shown by quarter",
             "totals_scope": "visible_approved_aggregate_rows_only",
         })
     return Response({"audit_id": audit.pk, "results": result})
@@ -185,7 +443,7 @@ def drug_analysis(request, audit_id):
 @permission_classes([CanView])
 def hospital_comparison(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
-    rows = audit.results.exclude(hospital_price_per_unit__isnull=True)
+    rows = run_results(current_audit_run(audit)).exclude(hospital_price_per_unit__isnull=True)
     return Response([{
         "hcpcs_code": row.hcpcs_code, "site_npi": row.site_npi,
         "quarter": row.quarter, "service_setting": row.service_setting,
@@ -203,7 +461,7 @@ def hospital_comparison(request, audit_id):
 @permission_classes([CanView])
 def asp_benchmark(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
-    rows = audit.results.all().order_by("hcpcs_code", "quarter", "site_npi")
+    rows = run_results(current_audit_run(audit)).order_by("hcpcs_code", "quarter", "site_npi")
     return Response([{
         "hcpcs_code": row.hcpcs_code, "site_npi": row.site_npi,
         "quarter": row.quarter, "plan_allowed_price_per_unit": _decimal_text(row.plan_allowed_price_per_unit),
@@ -220,7 +478,11 @@ def asp_benchmark(request, audit_id):
 @permission_classes([CanView])
 def audit_overview(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
-    return Response({"audit": audit_payload(audit), "metrics": _visible_totals(audit)})
+    return Response({"audit": audit_payload(audit, request.user),
+                     "metrics": _visible_totals(
+                         audit, current_audit_run(audit),
+                         include_unvalidated_savings=not is_client_only(request.user),
+                     )})
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +555,7 @@ def historical_spending(request, audit_id):
             "data_notes": _spending_notes(),
         })
 
-    queryset = audit.results.all()
+    queryset = run_results(current_audit_run(audit))
     queryset = _safe_filter(queryset, request.query_params)
 
     # Aggregate across the filtered result set. All arithmetic uses Decimal.

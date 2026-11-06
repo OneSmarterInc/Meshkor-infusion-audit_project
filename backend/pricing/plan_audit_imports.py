@@ -322,25 +322,9 @@ def plan_audits(request):
     queryset = PlanAudit.objects.select_related(
         "organization", "plan", "summary_import", "created_by"
     ).filter(organization__in=visible_organizations(request.user))
-    if (not is_admin(request.user)
-            and has_any_role(request.user, {"CLIENT", "Viewer"})
-            and not has_any_role(request.user, {SUPER_ADMIN_GROUP, ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP})):
-        from django.db.models import OuterRef, Subquery
-        from .models import AuditReview
-        latest_status = Subquery(
-            AuditReview.objects.filter(plan_audit=OuterRef("pk"))
-            .order_by("-reviewed_at", "-id")
-            .values("review_status")[:1]
-        )
-        queryset = queryset.filter(
-            status="completed",
-            report_generated_at__isnull=False,
-        ).annotate(latest_review_status=latest_status).filter(
-            latest_review_status="approved"
-        )
     if request.query_params.get("plan_id"):
         queryset = queryset.filter(plan_id=request.query_params["plan_id"])
-    return Response([audit_payload(item) for item in queryset[:200]])
+    return Response([audit_payload(item, request.user) for item in queryset[:200]])
 
 
 @api_view(["POST"])
@@ -368,10 +352,11 @@ def create_plan_audit(request):
         audit_name=name, reporting_period=period, created_by=request.user)
     AuditEvent.objects.create(actor=request.user, action="plan_audit_created",
                               entity_type="plan_audit", entity_id=str(item.pk))
-    return Response(audit_payload(item), status=201)
+    return Response(audit_payload(item, request.user), status=201)
 
 
 @api_view(["GET"])
 @permission_classes([CanView])
 def plan_audit_detail(request, audit_id):
-    return Response(audit_payload(get_visible_audit(request.user, audit_id)))
+    from .plan_audit_common import get_accessible_audit
+    return Response(audit_payload(get_accessible_audit(request.user, audit_id), request.user))

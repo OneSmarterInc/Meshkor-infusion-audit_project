@@ -69,9 +69,34 @@ from .models import (
 
 for model in (
     PlanOrganization, Plan, ClaimsSummaryImport, ClaimsSummaryRecord,
-    NetworkRosterEntry, PlanAudit, PlanAuditResult, SavingsOpportunity,
+    NetworkRosterEntry,
 ):
     admin.site.register(model)
+
+
+@admin.register(PlanAudit)
+class PlanAuditAdmin(admin.ModelAdmin):
+    readonly_fields = ("created_by",)
+
+
+class AuditRunRowAdmin(admin.ModelAdmin):
+    """Expose run snapshots for inspection without allowing history edits."""
+
+    def get_readonly_fields(self, request, obj=None):
+        return tuple(field.name for field in self.model._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+admin.site.register(PlanAuditResult, AuditRunRowAdmin)
+admin.site.register(SavingsOpportunity, AuditRunRowAdmin)
 
 from .models import PlanOrganizationAccess
 

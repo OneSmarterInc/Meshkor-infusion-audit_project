@@ -8,6 +8,24 @@ import pytest
 BACKEND = Path(__file__).resolve().parent.parent / "backend"
 
 
+def mfa_force_login(client, user):
+    """Create explicit server-side MFA evidence for tests unrelated to sign-in."""
+    from pricing.mfa import mark_mfa_verified
+    from pricing.models import AdminOTPDevice
+
+    device, _ = AdminOTPDevice.objects.get_or_create(
+        user=user, defaults={"secret": "test-only-mfa-device", "enabled": True},
+    )
+    if not device.enabled:
+        device.enabled = True
+        device.save(update_fields=["enabled", "updated_at"])
+    client.force_login(user)
+    session = client.session
+    mark_mfa_verified(session, user, device)
+    session.save()
+    return client
+
+
 @pytest.fixture
 def client(built, db):
     sys.path.insert(0, str(BACKEND))
@@ -20,8 +38,7 @@ def client(built, db):
         username="audit-test-admin", email="audit-test@example.invalid", password="test-only-password"
     )
     test_client = Client()
-    test_client.force_login(user)
-    return test_client
+    return mfa_force_login(test_client, user)
 
 
 def test_meta(client):
@@ -88,7 +105,7 @@ def test_reviewer_can_see_current_draft_needed_for_report_release(client):
     )
     reviewer.groups.add(Group.objects.get_or_create(name=REVIEWER_GROUP)[0])
     reviewer_client = Client()
-    reviewer_client.force_login(reviewer)
+    mfa_force_login(reviewer_client, reviewer)
 
     response = reviewer_client.get("/api/v1/reports/")
     assert response.status_code == 200, response.content
@@ -118,7 +135,7 @@ def test_two_role_model_keeps_viewer_out_of_admin_operations(client):
     )
     viewer.groups.add(Group.objects.get_or_create(name=VIEWER_GROUP)[0])
     viewer_client = Client()
-    viewer_client.force_login(viewer)
+    mfa_force_login(viewer_client, viewer)
     assert viewer_client.get("/api/v1/dashboard/summary/").status_code == 403
     assert viewer_client.get("/api/v1/sources/").status_code == 403
     assert viewer_client.get("/api/v1/sources/jobs/").status_code == 403
@@ -135,7 +152,7 @@ def test_staff_flag_alone_does_not_grant_application_admin(client):
         is_staff=True,
     )
     staff_client = Client()
-    staff_client.force_login(staff)
+    mfa_force_login(staff_client, staff)
     assert staff_client.get("/api/v1/dashboard/summary/").status_code == 403
 
 
@@ -252,7 +269,6 @@ def test_viewer_login_requires_totp_enrollment_and_second_factor(client):
     from django.contrib.auth import get_user_model
     from django.contrib.auth.models import Group
     from django.test import Client, override_settings
-    import time
     from pricing.otp import code_at
 
     user = get_user_model().objects.create_user(
@@ -287,9 +303,9 @@ def test_viewer_login_requires_totp_enrollment_and_second_factor(client):
             "username": "jwt-viewer", "password": "long-test-password-123",
         }, content_type="application/json")
         assert password_response.json()["otp_required"] is True
-        next_code, _ = code_at(setup.json()["secret"], time.time() + 30)
         verified = next_client.post("/api/v1/authentication/totp/sign-in-verification/", {
-            "challenge": password_response.json()["challenge"], "code": next_code,
+            "challenge": password_response.json()["challenge"],
+            "recovery_code": confirmation.json()["recovery_codes"][0],
         }, content_type="application/json")
         assert verified.status_code == 200
         assert "no-store" in verified.headers.get("Cache-Control", "")
@@ -470,6 +486,17 @@ def test_medicare_part_b_drugs_reject_unauthorized_users():
 
 
 def test_rates_filter_and_sort(client):
+    paged = client.get("/api/v1/hospital-drug-price-comparisons/", {
+        "sort": "markup_multiple", "order": "desc", "limit": 50, "offset": 0,
+    })
+    assert paged.status_code == 200, paged.content
+    paged_result = paged.json()
+    paged_rows = paged_result["rows"]
+    assert len(paged_rows) == min(paged_result["total"], 50)
+    paged_markups = [row["markup_multiple"] for row in paged_rows if row["markup_multiple"] is not None]
+    assert paged_markups == sorted(paged_markups, reverse=True)
+    assert all(row["markup_multiple"] is None for row in paged_rows[len(paged_markups):])
+
     r = client.get("/api/rates", {"hcpcs": "J9271", "price_type": "negotiated_dollar",
                                   "status": "ok", "sort": "markup_multiple"}).json()
     assert r["total"] == 5
@@ -478,6 +505,24 @@ def test_rates_filter_and_sort(client):
     # unsafe sort value falls back to markup_multiple
     assert client.get("/api/rates", {"sort": "1; DROP TABLE x"}).status_code == 200
     assert client.get("/api/rates", {"limit": "many"}).status_code == 400
+
+
+def test_production_comparison_parquet_supports_rate_projection(monkeypatch):
+    """Guard the real snapshot against DuckDB projected-column reader regressions."""
+    from pricing import data
+
+    comparison = BACKEND.parent / "data" / "mart" / "comparison.parquet"
+    monkeypatch.setattr(data, "files", lambda: {"comparison": comparison})
+    monkeypatch.setattr(data, "require_current_scope", lambda: "verified_source")
+
+    rows = data.query(
+        "SELECT hospital_key, price, asp_payment_limit, markup_multiple FROM {cmp} "
+        "ORDER BY markup_multiple DESC NULLS LAST LIMIT 50 OFFSET 0",
+        cmp="comparison",
+    )
+    assert len(rows) == 50
+    assert str(rows[0]["markup_multiple"]) == "0.33013196677384780278670953910"
+    assert str(rows[-1]["markup_multiple"]) == "0.11088290460878885316184351550"
 
 
 def test_comparison_payer_filter_options_come_from_parquet(client):
@@ -595,7 +640,7 @@ def test_viewer_cannot_read_source_inventory_or_job_logs(built, db):
     from pricing.permissions import VIEWER_GROUP
     user.groups.add(Group.objects.get_or_create(name=VIEWER_GROUP)[0])
     viewer = Client()
-    viewer.force_login(user)
+    mfa_force_login(viewer, user)
     assert viewer.get("/api/v1/sources/").status_code == 403
     assert viewer.get("/api/v1/sources/jobs/").status_code == 403
 
@@ -820,7 +865,7 @@ def test_claims_explorer_organization_scoping_and_privacy(client, db):
     user.groups.add(analyst_group)
 
     analyst_client = DjangoClient()
-    analyst_client.force_login(user)
+    mfa_force_login(analyst_client, user)
 
     # User with no organization access assigned gets 403
     res_no_org = analyst_client.get("/api/v1/claims/")
@@ -918,7 +963,7 @@ def test_plan_audit_asp_lookup_never_falls_back_to_latest_quarter(client):
     assert errors == 0
 
 
-def test_end_to_end_plan_audit_workflow(client, db, tmp_path):
+def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     import csv
     import io
     import json
@@ -955,10 +1000,70 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path):
     rev_user = get_user_model().objects.create_user(username="e2e-reviewer", password="test-password")
     rev_user.groups.add(rev_group)
     grant_res = client.post(f"/api/v1/organizations/{org_id}/users/", {"user_id": rev_user.pk}, content_type="application/json")
-    assert grant_res.status_code in {200, 201}
+    assert grant_res.status_code == 201, grant_res.content
+    assert grant_res.json()["created"] is True
+    duplicate_grant = client.post(f"/api/v1/organizations/{org_id}/users/",
+                                  {"user_id": rev_user.pk}, content_type="application/json")
+    assert duplicate_grant.status_code == 200
+    assert duplicate_grant.json()["created"] is False
+    from pricing.models import PlanOrganizationAccess
+    assert PlanOrganizationAccess.objects.filter(organization_id=org_id, user=rev_user).count() == 1
 
     rev_client = DjangoClient()
-    rev_client.force_login(rev_user)
+    mfa_force_login(rev_client, rev_user)
+    assert rev_client.get("/api/v1/organizations/").status_code == 200
+    assert any(item["id"] == org_id for item in rev_client.get("/api/v1/organizations/").json())
+    assert rev_client.post(f"/api/v1/organizations/{org_id}/users/", {"user_id": rev_user.pk},
+                           content_type="application/json").status_code == 403
+    rev_b_user = get_user_model().objects.create_user(username="e2e-reviewer-b", password="test-password")
+    rev_b_user.groups.add(rev_group)
+    assert rev_client.delete(f"/api/v1/organizations/{org_id}/users/{rev_b_user.pk}/").status_code == 403
+    assert client.post(f"/api/v1/organizations/{org_id}/users/", {"user_id": rev_b_user.pk},
+                       content_type="application/json").status_code in {200, 201}
+    rev_b_client = DjangoClient()
+    mfa_force_login(rev_b_client, rev_b_user)
+
+    client_group, _ = Group.objects.get_or_create(name="CLIENT")
+    client_user = get_user_model().objects.create_user(username="e2e-client-user", password="test-password")
+    client_user.groups.add(client_group)
+    assert client.post(f"/api/v1/organizations/{org_id}/users/", {"user_id": client_user.pk},
+                       content_type="application/json").status_code in {200, 201}
+    client_test_client = DjangoClient()
+    mfa_force_login(client_test_client, client_user)
+    assert client_test_client.post(f"/api/v1/organizations/{org_id}/users/",
+                                   {"user_id": rev_user.pk}, content_type="application/json").status_code == 403
+    analyst_group, _ = Group.objects.get_or_create(name="ANALYST")
+    analyst_user = get_user_model().objects.create_user(username="mk06-analyst", password="test-password")
+    analyst_user.groups.add(analyst_group)
+    analyst_client = DjangoClient()
+    mfa_force_login(analyst_client, analyst_user)
+    assert analyst_client.post(f"/api/v1/organizations/{org_id}/users/",
+                               {"user_id": rev_user.pk}, content_type="application/json").status_code == 403
+    mixed_client_reviewer = get_user_model().objects.create_user(
+        username="mk05-mixed-assigned-reviewer", password="test-password")
+    mixed_client_reviewer.groups.add(client_group, rev_group)
+    assert client.post(f"/api/v1/organizations/{org_id}/users/",
+                       {"user_id": mixed_client_reviewer.pk}, content_type="application/json").status_code in {200, 201}
+    mixed_client_reviewer_client = DjangoClient()
+    mfa_force_login(mixed_client_reviewer_client, mixed_client_reviewer)
+    assert client.post(f"/api/v1/organizations/{org_id}/users/",
+                       {"user_id": client_user.pk}, content_type="application/json").status_code == 200
+    assert PlanOrganizationAccess.objects.filter(organization_id=org_id, user=client_user).count() == 1
+    for candidate in (
+        get_user_model().objects.create_user(username="mk06-no-role", password="test-password"),
+        get_user_model().objects.create_user(username="mk06-inactive-reviewer", password="test-password",
+                                             is_active=False),
+        get_user_model().objects.create_superuser(username="mk06-target-superuser",
+                                                   email="mk06@example.invalid", password="test-password"),
+    ):
+        if candidate.username == "mk06-inactive-reviewer":
+            candidate.groups.add(rev_group)
+        assert client.post(f"/api/v1/organizations/{org_id}/users/",
+                           {"user_id": candidate.pk}, content_type="application/json").status_code == 400
+    assert client.post(f"/api/v1/organizations/{org_id}/users/", {"user_id": 99999999},
+                       content_type="application/json").status_code == 400
+    assert client.post(f"/api/v1/organizations/{org_id}/users/", {},
+                       content_type="application/json").status_code == 400
 
     # 3. Run the actual extractor on isolated fictional TEST claims.
     source_path = tmp_path / "claims_TEST.csv"
@@ -1090,15 +1195,59 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path):
         "summary_import_id": import_id,
         "audit_name": "2026 Q4 Oncology Infusion Audit",
         "reporting_period": "2026-01-01/2026-12-31",
+        "created_by_id": rev_user.pk,
     }, content_type="application/json")
     assert create_audit_res.status_code == 201, create_audit_res.content
     audit_id = create_audit_res.json()["id"]
+    superadmin_id = get_user_model().objects.get(username="audit-test-admin").pk
+    assert create_audit_res.json()["created_by_id"] == superadmin_id
+
+    from pricing.plan_audit_common import is_client_only
+    assert not is_client_only(get_user_model().objects.get(pk=superadmin_id))
+    assert is_client_only(client_user)
+    assert not is_client_only(rev_user)
+    superuser_audits = client.get("/api/v1/plan-audits/")
+    assert superuser_audits.status_code == 200
+    assert any(row["id"] == audit_id for row in superuser_audits.json())
+    superuser_draft = client.get(f"/api/v1/plan-audits/{audit_id}/")
+    assert superuser_draft.status_code == 200
+    assert superuser_draft.json()["status"] == "draft"
+    assert not superuser_draft.json()["can_view_results"]
+    assert superuser_draft.json()["created_by_id"] == superadmin_id
+    assert client.put(f"/api/v1/plan-audits/{audit_id}/", {"created_by_id": rev_user.pk},
+                      content_type="application/json").status_code == 405
+    assert client.patch(f"/api/v1/plan-audits/{audit_id}/", {"created_by_id": rev_user.pk},
+                        content_type="application/json").status_code == 405
+
+    client_drafts = client_test_client.get("/api/v1/plan-audits/")
+    assert client_drafts.status_code == 200
+    client_draft = next(row for row in client_drafts.json() if row["id"] == audit_id)
+    assert client_draft["can_view_results"] is False
+    assert client_draft["summary"] == {}
+    assert client_draft["result_fingerprint"] is None
+    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 200
+    for suffix in ("overview/", "results/", "drug-analysis/", "hospital-comparison/",
+                   "asp-benchmark/", "historical-spending/", "savings/", "quality/",
+                   "network-validation/", "report/", "export-csv/"):
+        assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/{suffix}").status_code == 404
+    assert client_test_client.post(f"/api/v1/plan-audits/{audit_id}/run/").status_code == 403
+    assert rev_client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 200
+    assert any(row["id"] == audit_id for row in rev_client.get("/api/v1/plan-audits/").json())
+    assert rev_client.post(f"/api/v1/plan-audits/{audit_id}/run/").status_code == 403
 
     # 6. Run Plan Audit
-    run_res = client.post(f"/api/v1/plan-audits/{audit_id}/run/")
+    run_res = client.post(f"/api/v1/plan-audits/{audit_id}/run/", {
+        "initiated_by_id": rev_user.pk,
+    }, content_type="application/json")
     assert run_res.status_code == 200, run_res.content
     audit_data = run_res.json()
     assert audit_data["status"] == "needs_review"
+    assert audit_data["run_initiated_by_id"] == superadmin_id
+    assert client.get("/api/v1/plan-audits/").status_code == 200
+    assert client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 200
+    assert rev_client.get(f"/api/v1/plan-audits/{audit_id}/results/").status_code == 200
+    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/results/").status_code == 404
+    assert mixed_client_reviewer_client.get(f"/api/v1/plan-audits/{audit_id}/results/").status_code == 200
 
     # 7. Check Audit Overview, Results, and Quality
     overview_res = client.get(f"/api/v1/plan-audits/{audit_id}/overview/")
@@ -1121,13 +1270,247 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path):
     assert Decimal(result["plan_paid_price_per_unit"]) == Decimal("120")
     assert client.get(f"/api/v1/plan-audits/{audit_id}/savings/").json() == []
 
+    # The actual unresolved engine output must not be publishable.
+    from pricing.models import (AuditEvent, AuditReview, PlanAudit, PlanAuditResult,
+                                PlanAuditRun, SavingsOpportunity)
+    from pricing.plan_audit_common import current_audit_run, run_result_fingerprint
+    audit_obj = PlanAudit.objects.get(pk=audit_id)
+    run_obj = current_audit_run(audit_obj)
+    unresolved_binding = {"version": run_obj.version,
+                          "result_fingerprint": run_result_fingerprint(run_obj)}
+    assert client.post(f"/api/v1/plan-audits/{audit_id}/generate-report/").status_code == 200
+    unresolved_approval = rev_client.post(f"/api/v1/plan-audits/{audit_id}/approve/",
+        {"comments": "Unresolved fixture must not publish.", **unresolved_binding},
+        content_type="application/json")
+    assert unresolved_approval.status_code == 409
+
+    # Legacy rows without current creator/run provenance cannot be published through the API.
+    from django.utils import timezone
+    legacy_audit_response = client.post("/api/v1/plan-audits/create/", {
+        "organization_id": org_id, "plan_id": plan_id, "summary_import_id": import_id,
+        "audit_name": "MK-04 legacy provenance fail-closed", "reporting_period": "2026Q4",
+    }, content_type="application/json")
+    assert legacy_audit_response.status_code == 201
+    legacy_audit = PlanAudit.objects.get(pk=legacy_audit_response.json()["id"])
+    legacy_run = PlanAuditRun.objects.create(
+        plan_audit=legacy_audit, version=1, calculation_status="legacy_unverified",
+        publication_status="unverified", summary_import_id=import_id,
+        initiated_by=None, started_at=timezone.now(),
+    )
+    legacy_audit.current_version = 1
+    legacy_audit.status = "needs_review"
+    legacy_audit.save(update_fields=["current_version", "status"])
+    legacy_approval = rev_client.post(
+        f"/api/v1/plan-audits/{legacy_audit.pk}/approve/",
+        {"comments": "Legacy version without provenance.", "version": 1,
+         "result_fingerprint": ""}, content_type="application/json")
+    assert legacy_approval.status_code == 409
+    legacy_run.refresh_from_db()
+    legacy_audit.refresh_from_db()
+    assert legacy_run.publication_status == "unverified"
+    assert legacy_audit.published_version is None
+
+    # Start v2 with validated fixture evidence supplied during the active calculation.
+    from pricing import plan_audit_run
+    original_engine = plan_audit_run.run_plan_audit
+
+    def validated_fixture_engine(audit, active_run):
+        summary = original_engine(audit, active_run)
+        for row in PlanAuditResult.objects.filter(audit_run=active_run):
+            refs = dict(row.source_references)
+            refs["unit_review_status"] = "validated"
+            refs["unit_review_source_sha256"] = "f" * 64
+            row.data_quality_status = "VALID"
+            row.source_references = refs
+            row.save(update_fields=["data_quality_status", "source_references"])
+        SavingsOpportunity.objects.create(
+            plan_audit=audit, audit_run=active_run, hcpcs_code="J9271",
+            quarter="2026Q4", service_setting="outpatient_hospital",
+            current_site_npi="1000000004", alternative_site_npi="1000000012",
+            current_allowed_price_per_unit=Decimal("150"),
+            alternative_allowed_price_per_unit=Decimal("120"), units=Decimal("10"),
+            potential_allowed_savings=Decimal("300"), network_status="IN_NETWORK",
+            source_references={"fixture": "isolated validation lifecycle test"},
+        )
+        return summary
+
+    monkeypatch.setattr(plan_audit_run, "run_plan_audit", validated_fixture_engine)
+
+    analyst_group, _ = Group.objects.get_or_create(name="ANALYST")
+
+    def make_contributor(username, roles):
+        contributor = get_user_model().objects.create_user(username=username, password="test-password")
+        contributor.groups.add(*roles)
+        assert client.post(f"/api/v1/organizations/{org_id}/users/", {"user_id": contributor.pk},
+                           content_type="application/json").status_code in {200, 201}
+        contributor_client = DjangoClient()
+        mfa_force_login(contributor_client, contributor)
+        return contributor, contributor_client
+
+    run_contributor, run_contributor_client = make_contributor(
+        "mk04-run-contributor", [analyst_group, rev_group])
+    artifact_contributor, artifact_contributor_client = make_contributor(
+        "mk04-artifact-contributor", [analyst_group, rev_group])
+    csv_contributor, csv_contributor_client = make_contributor(
+        "mk04-csv-contributor", [analyst_group, rev_group])
+    analyst_only, analyst_only_client = make_contributor("mk04-analyst-only", [analyst_group])
+    assert analyst_only_client.get("/api/v1/plan-audits/").status_code == 200
+    assert analyst_only_client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 200
+    assert rev_client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 200
+    # Creator, run initiator, and artifact builder are independently checked.
+    contributor_audit_response = client.post("/api/v1/plan-audits/create/", {
+        "organization_id": org_id, "plan_id": plan_id, "summary_import_id": import_id,
+        "audit_name": "MK-04 contributor independence", "reporting_period": "2026-01-01/2026-12-31",
+    }, content_type="application/json")
+    assert contributor_audit_response.status_code == 201
+    contributor_audit_id = contributor_audit_response.json()["id"]
+    assert run_contributor_client.post(f"/api/v1/plan-audits/{contributor_audit_id}/run/").status_code == 200
+    contributor_audit = PlanAudit.objects.get(pk=contributor_audit_id)
+    contributor_run = current_audit_run(contributor_audit)
+    contributor_binding = {"version": contributor_run.version,
+                           "result_fingerprint": contributor_run.result_fingerprint}
+    assert artifact_contributor_client.post(
+        f"/api/v1/plan-audits/{contributor_audit_id}/generate-report/").status_code == 200
+    contributor_artifacts = {
+        artifact.artifact_type: artifact for artifact in contributor_run.artifacts.all()
+    }
+    contributor_artifacts["csv"].created_by_id = csv_contributor.pk
+    contributor_artifacts["csv"].save(update_fields=["created_by"])
+    assert contributor_artifacts["pdf"].created_by_id == artifact_contributor.pk
+    assert contributor_artifacts["csv"].created_by_id == csv_contributor.pk
+
+    def assert_not_published(response, audit_record, run_record, expected_status=403):
+        assert response.status_code == expected_status, response.content
+        audit_record.refresh_from_db()
+        run_record.refresh_from_db()
+        assert audit_record.published_version is None
+        assert run_record.publication_status == "pending"
+        assert not AuditReview.objects.filter(audit_run=run_record, review_status="approved").exists()
+        assert not AuditEvent.objects.filter(
+            action="plan_audit_approved", entity_id=str(audit_record.pk)).exists()
+        for suffix in ("overview/", "results/", "report/", "export-csv/"):
+            assert client_test_client.get(
+                f"/api/v1/plan-audits/{audit_record.pk}/{suffix}").status_code == 404
+
+    stale_fingerprint_attempt = rev_client.post(
+        f"/api/v1/plan-audits/{contributor_audit_id}/approve/",
+        {"comments": "Stale result binding.", "version": contributor_binding["version"],
+         "result_fingerprint": "0" * 64}, content_type="application/json")
+    assert_not_published(stale_fingerprint_attempt, contributor_audit, contributor_run, expected_status=409)
+    creator_attempt = client.post(f"/api/v1/plan-audits/{contributor_audit_id}/approve/",
+        {"comments": "Creator cannot approve.", **contributor_binding}, content_type="application/json")
+    assert_not_published(creator_attempt, contributor_audit, contributor_run)
+    runner_attempt = run_contributor_client.post(
+        f"/api/v1/plan-audits/{contributor_audit_id}/approve/",
+        {"comments": "Run initiator cannot approve.", **contributor_binding}, content_type="application/json")
+    assert_not_published(runner_attempt, contributor_audit, contributor_run)
+    artifact_attempt = artifact_contributor_client.post(
+        f"/api/v1/plan-audits/{contributor_audit_id}/approve/",
+        {"comments": "PDF builder cannot approve.", **contributor_binding}, content_type="application/json")
+    assert_not_published(artifact_attempt, contributor_audit, contributor_run)
+    csv_builder_attempt = csv_contributor_client.post(
+        f"/api/v1/plan-audits/{contributor_audit_id}/approve/",
+        {"comments": "CSV builder cannot approve.", **contributor_binding}, content_type="application/json")
+    assert_not_published(csv_builder_attempt, contributor_audit, contributor_run)
+    analyst_attempt = analyst_only_client.post(
+        f"/api/v1/plan-audits/{contributor_audit_id}/approve/",
+        {"comments": "Analyst without reviewer role cannot approve.", **contributor_binding},
+        content_type="application/json")
+    assert_not_published(analyst_attempt, contributor_audit, contributor_run)
+    assert client_test_client.get(f"/api/v1/plan-audits/{contributor_audit_id}/report/").status_code == 404
+    independent_review = rev_client.post(
+        f"/api/v1/plan-audits/{contributor_audit_id}/approve/",
+        {"comments": "Independent reviewer approval.", **contributor_binding}, content_type="application/json")
+    assert independent_review.status_code == 200
+
+    # Missing historical identity at any contributor stage fails closed.
+    missing_identity_response = client.post("/api/v1/plan-audits/create/", {
+        "organization_id": org_id, "plan_id": plan_id, "summary_import_id": import_id,
+        "audit_name": "MK-04 missing contributor identity", "reporting_period": "2026-01-01/2026-12-31",
+    }, content_type="application/json")
+    assert missing_identity_response.status_code == 201
+    missing_identity_id = missing_identity_response.json()["id"]
+    assert run_contributor_client.post(f"/api/v1/plan-audits/{missing_identity_id}/run/").status_code == 200
+    missing_audit = PlanAudit.objects.get(pk=missing_identity_id)
+    missing_run = current_audit_run(missing_audit)
+    missing_binding = {"version": missing_run.version, "result_fingerprint": missing_run.result_fingerprint}
+    assert artifact_contributor_client.post(
+        f"/api/v1/plan-audits/{missing_identity_id}/generate-report/").status_code == 200
+    creator_id, initiator_id = missing_audit.created_by_id, missing_run.initiated_by_id
+    artifact_rows = list(missing_run.artifacts.all())
+    missing_audit.created_by_id = None
+    missing_audit.save(update_fields=["created_by"])
+    missing_creator_attempt = rev_client.post(f"/api/v1/plan-audits/{missing_identity_id}/approve/",
+        {"comments": "Missing creator must fail closed.", **missing_binding}, content_type="application/json")
+    assert_not_published(missing_creator_attempt, missing_audit, missing_run, expected_status=409)
+    missing_audit.created_by_id = creator_id
+    missing_audit.save(update_fields=["created_by"])
+    missing_run.initiated_by_id = None
+    missing_run.save(update_fields=["initiated_by"])
+    missing_initiator_attempt = rev_client.post(f"/api/v1/plan-audits/{missing_identity_id}/approve/",
+        {"comments": "Missing initiator must fail closed.", **missing_binding}, content_type="application/json")
+    assert_not_published(missing_initiator_attempt, missing_audit, missing_run, expected_status=409)
+    missing_run.initiated_by_id = initiator_id
+    missing_run.save(update_fields=["initiated_by"])
+    missing_builder_types = set()
+    for artifact in artifact_rows:
+        builder_id = artifact.created_by_id
+        artifact.created_by_id = None
+        artifact.save(update_fields=["created_by"])
+        missing_builder_attempt = rev_client.post(f"/api/v1/plan-audits/{missing_identity_id}/approve/", {
+            "comments": f"Missing {artifact.artifact_type} builder must fail closed.", **missing_binding,
+        }, content_type="application/json")
+        assert_not_published(missing_builder_attempt, missing_audit, missing_run, expected_status=409)
+        missing_builder_types.add(artifact.artifact_type)
+        artifact.created_by_id = builder_id
+        artifact.save(update_fields=["created_by"])
+    assert missing_builder_types == {"pdf", "csv"}
+    independent_superadmin = get_user_model().objects.create_superuser(
+        username="mk04-independent-superadmin", email="mk04-superadmin@example.invalid", password="test-password")
+    independent_superadmin_client = DjangoClient()
+    mfa_force_login(independent_superadmin_client, independent_superadmin)
+    superadmin_approval = independent_superadmin_client.post(
+        f"/api/v1/plan-audits/{missing_identity_id}/approve/",
+        {"comments": "Independent SUPER_ADMIN approval.", **missing_binding}, content_type="application/json")
+    assert superadmin_approval.status_code == 200
+
+    valid_rerun = client.post(f"/api/v1/plan-audits/{audit_id}/run/")
+    assert valid_rerun.status_code == 200, valid_rerun.content
+    audit_obj.refresh_from_db()
+    run_obj = current_audit_run(audit_obj)
+    artifact_res = client.post(f"/api/v1/plan-audits/{audit_id}/generate-report/", {
+        "created_by_id": rev_user.pk,
+    }, content_type="application/json")
+    assert artifact_res.status_code == 200
+    contributor_metadata = client.get(f"/api/v1/plan-audits/{audit_id}/").json()
+    assert contributor_metadata["created_by_id"] == superadmin_id
+    assert contributor_metadata["run_initiated_by_id"] == superadmin_id
+    assert [builder["id"] for builder in contributor_metadata["artifact_builders"]] == [superadmin_id, superadmin_id]
+    binding = {"version": run_obj.version, "result_fingerprint": run_obj.result_fingerprint}
+
+    # MK-04 reproduction: the SUPER_ADMIN created, ran, and built this version.
+    self_approval = client.post(f"/api/v1/plan-audits/{audit_id}/approve/", {
+        "comments": "Attempted self-approval reproduction.", **binding,
+        "created_by_id": rev_user.pk, "initiated_by_id": rev_user.pk,
+        "artifact_builder_ids": [],
+    }, content_type="application/json")
+    assert self_approval.status_code == 403
+    run_obj.refresh_from_db()
+    audit_obj.refresh_from_db()
+    assert run_obj.publication_status == "pending"
+    assert audit_obj.published_version is None
+    assert not AuditReview.objects.filter(audit_run=run_obj, review_status="approved").exists()
+    assert not AuditEvent.objects.filter(action="plan_audit_approved", entity_id=str(audit_id)).exists()
+    for suffix in ("overview/", "results/", "report/", "export-csv/"):
+        assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/{suffix}").status_code == 404
+
     # 8. Review workflow: Reviewer submits comment and approves
     # Non-reviewer gets 403
     viewer_group, _ = Group.objects.get_or_create(name="Viewer")
     unauth_user = get_user_model().objects.create_user(username="unauth-viewer", password="test-password")
     unauth_user.groups.add(viewer_group)
     unauth_client = DjangoClient()
-    unauth_client.force_login(unauth_user)
+    mfa_force_login(unauth_client, unauth_user)
 
     unauth_approve = unauth_client.post(f"/api/v1/plan-audits/{audit_id}/approve/")
     assert unauth_approve.status_code == 403
@@ -1135,10 +1518,12 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path):
     # Reviewer submits comment
     comment_res = rev_client.post(f"/api/v1/plan-audits/{audit_id}/review/", {
         "comments": "Reviewed aggregate rows and ASP benchmarks; verified in-network clinical status.",
+        **binding,
     }, content_type="application/json")
     assert comment_res.status_code == 201
     second_comment = rev_client.post(f"/api/v1/plan-audits/{audit_id}/review/", {
         "comments": "Confirmed that source aggregates remain distinct by HCPCS, site, and quarter.",
+        **binding,
     }, content_type="application/json")
     assert second_comment.status_code == 201
     assert second_comment.json()["id"] != comment_res.json()["id"]
@@ -1146,17 +1531,40 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path):
     # Reviewer approves audit
     approve_res = rev_client.post(f"/api/v1/plan-audits/{audit_id}/approve/", {
         "comments": "Approved after clinical verification.",
+        **binding,
     }, content_type="application/json")
     assert approve_res.status_code == 200
     assert approve_res.json()["review_status"] == "approved"
+    published_run = run_obj
+    published_result = PlanAuditResult.objects.filter(audit_run=published_run).first()
+    published_saving = SavingsOpportunity.objects.get(audit_run=published_run)
+    from django.core.exceptions import ValidationError
+    for write_attempt in (
+        lambda: published_result.save(),
+        lambda: published_result.delete(),
+        lambda: PlanAuditResult.objects.filter(pk=published_result.pk).update(total_units=Decimal("0")),
+        lambda: PlanAuditResult.objects.filter(pk=published_result.pk).delete(),
+        lambda: PlanAuditResult.objects.bulk_create([
+            PlanAuditResult(audit_run=published_run),
+        ]),
+        lambda: published_saving.save(),
+        lambda: published_saving.delete(),
+        lambda: SavingsOpportunity.objects.filter(pk=published_saving.pk).update(
+            potential_allowed_savings=Decimal("0")),
+        lambda: SavingsOpportunity.objects.filter(pk=published_saving.pk).delete(),
+        lambda: SavingsOpportunity.objects.bulk_create([
+            SavingsOpportunity(audit_run=published_run),
+        ]),
+    ):
+        with pytest.raises(ValidationError):
+            write_attempt()
     review_history = rev_client.get(f"/api/v1/plan-audits/{audit_id}/review/")
     assert review_history.status_code == 200
     assert len(review_history.json()) == 3
     assert {item["review_status"] for item in review_history.json()} == {"submitted", "approved"}
 
     # 9. Generate Report and Download PDF & CSV
-    gen_res = client.post(f"/api/v1/plan-audits/{audit_id}/generate-report/")
-    assert gen_res.status_code == 200
+    gen_res = artifact_res
 
     pdf_res = client.get(f"/api/v1/plan-audits/{audit_id}/report/")
     assert pdf_res.status_code == 200
@@ -1188,15 +1596,6 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path):
     assert len(hs_setting.json()["by_setting"]) == 1
 
     # 11. Client/Viewer Access Control & Subsequent Rejection Gate
-    client_group, _ = Group.objects.get_or_create(name="CLIENT")
-    client_user = get_user_model().objects.create_user(username="e2e-client-user", password="test-password")
-    client_user.groups.add(client_group)
-    # Grant client user access to org_id
-    client.post(f"/api/v1/organizations/{org_id}/users/", {"user_id": client_user.pk}, content_type="application/json")
-
-    client_test_client = DjangoClient()
-    client_test_client.force_login(client_user)
-
     # Currently approved -> Client sees audit
     client_audits_res = client_test_client.get("/api/v1/plan-audits/")
     assert client_audits_res.status_code == 200
@@ -1204,35 +1603,325 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path):
 
     client_report_res = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/report/")
     assert client_report_res.status_code == 200
+    assert client_test_client.post(f"/api/v1/plan-audits/{audit_id}/approve/", binding,
+                                   content_type="application/json").status_code == 403
+    assert client_test_client.post(f"/api/v1/plan-audits/{audit_id}/reject/", binding,
+                                   content_type="application/json").status_code == 403
 
-    # Reviewer subsequent rejection -> gate closes for Client
-    reject_res = rev_client.post(f"/api/v1/plan-audits/{audit_id}/reject/", {
+    missing_reason = rev_b_client.post(f"/api/v1/plan-audits/{audit_id}/reject/",
+        {"comments": "  ", **binding}, content_type="application/json")
+    assert missing_reason.status_code == 400
+    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/report/").status_code == 200
+
+    # Reviewer B rejects A's published version; A's old approval must not reopen it.
+    reject_res = rev_b_client.post(f"/api/v1/plan-audits/{audit_id}/reject/", {
         "comments": "Requires recalculation of clinical dose following physician inquiry.",
+        **binding,
     }, content_type="application/json")
     assert reject_res.status_code == 200
     assert reject_res.json()["review_status"] == "rejected"
+    assert reject_res.json()["publication_status"] == "rejected"
+    assert reject_res.json()["published_version"] is None
+    assert reject_res.json()["reviewer"] == rev_b_user.get_username()
+    assert reject_res.json()["reason"] == "Requires recalculation of clinical dose following physician inquiry."
+    assert reject_res.json()["reviewed_at"]
+    historical_approval = rev_client.post(f"/api/v1/plan-audits/{audit_id}/approve/", {
+        "comments": "Retry the old approval.", **binding,
+    }, content_type="application/json")
+    assert historical_approval.status_code == 409
+
+    ordinary_comment = rev_client.post(f"/api/v1/plan-audits/{audit_id}/review/", {
+        "comments": "Additional note after rejection.", **binding,
+    }, content_type="application/json")
+    assert ordinary_comment.status_code == 201
 
     # Client user can no longer view or download rejected audit
     client_audits_after = client_test_client.get("/api/v1/plan-audits/")
-    assert not any(a["id"] == audit_id for a in client_audits_after.json())
+    pending = next(a for a in client_audits_after.json() if a["id"] == audit_id)
+    assert pending["publication_status"] == "rejected"
+    assert pending["can_view_results"] is False
+    assert pending["summary"] == {}
+    assert pending["result_fingerprint"] is None
+    assert pending["latest_publication_decision"] == {
+        "status": "rejected", "reviewer": rev_b_user.get_username(),
+        "reviewed_at": reject_res.json()["reviewed_at"],
+        "reason": None,
+    }
 
-    client_report_after = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/report/")
-    assert client_report_after.status_code == 404
+    for suffix in (
+        "overview/", "results/", "drug-analysis/", "hospital-comparison/",
+        "asp-benchmark/", "historical-spending/", "savings/", "quality/",
+        "network-validation/", "report/", "export-csv/", "review/",
+    ):
+        assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/{suffix}").status_code == 404
+    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 200
+    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/").json()["summary"] == {}
+    assert client_test_client.post(f"/api/v1/plan-audits/{audit_id}/generate-report/").status_code == 403
+
+    # Approved v2 -> rerun revokes publication -> v3 approval restores access.
+    rerun = client.post(f"/api/v1/plan-audits/{audit_id}/run/")
+    assert rerun.status_code == 200, rerun.content
+    assert rerun.json()["current_version"] == 3
+    stale_rejection = rev_b_client.post(f"/api/v1/plan-audits/{audit_id}/reject/", {
+        "comments": "Stale rejection for the previous run.", **binding,
+    }, content_type="application/json")
+    assert stale_rejection.status_code == 409
+    listed = client_test_client.get("/api/v1/plan-audits/").json()
+    assert next(item for item in listed if item["id"] == audit_id)["publication_status"] != "published"
+    for suffix in ("overview/", "results/", "report/", "export-csv/", "savings/", "quality/"):
+        assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/{suffix}").status_code == 404
+    audit_obj.refresh_from_db()
+    run_obj = current_audit_run(audit_obj)
+    second_artifacts = client.post(f"/api/v1/plan-audits/{audit_id}/generate-report/")
+    assert second_artifacts.status_code == 200
+    second_binding = {"version": run_obj.version, "result_fingerprint": run_obj.result_fingerprint}
+    stale_approval = rev_client.post(f"/api/v1/plan-audits/{audit_id}/approve/", binding,
+                                     content_type="application/json")
+    assert stale_approval.status_code == 409
+    reapproval = rev_client.post(f"/api/v1/plan-audits/{audit_id}/approve/", second_binding,
+                                 content_type="application/json")
+    assert reapproval.status_code == 200, reapproval.content
+    assert reapproval.json()["version"] == 3
+    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/overview/").status_code == 200
+    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/results/").status_code == 200
+    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/report/").status_code == 200
+    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/export-csv/").status_code == 200
+
+    # A failed v4 calculation must not restore v3 client publication.
+    monkeypatch.setattr(plan_audit_run, "run_plan_audit", lambda *_args: (_ for _ in ()).throw(RuntimeError("fixture failure")))
+    failed_run = client.post(f"/api/v1/plan-audits/{audit_id}/run/")
+    assert failed_run.status_code == 500
+    failed_audit = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/")
+    assert failed_audit.status_code == 200
+    assert failed_audit.json()["calculation_status"] == "failed"
+    assert failed_audit.json()["publication_status"] == "failed"
+    for suffix in ("overview/", "results/", "report/", "export-csv/"):
+        assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/{suffix}").status_code == 404
 
     # 12. Cross-organization isolation
     org2_res = client.post("/api/v1/organizations/", {
         "organization_name": "Isolated Other Employer", "organization_type": "employer",
     }, content_type="application/json")
     org2_id = org2_res.json()["id"]
+    from pricing.models import ClaimsSummaryImport, Plan, PlanAudit, PlanOrganization
+    org2 = PlanOrganization.objects.get(pk=org2_id)
+    org2_plan = Plan.objects.create(organization=org2, plan_name="Other organization synthetic plan",
+                                    plan_reference="OTHER-ORG-TEST")
+    org2_import = ClaimsSummaryImport.objects.create(
+        organization=org2, plan=org2_plan, source_file_name="synthetic.csv",
+        file_hash="a" * 64, schema_version="test-v1", import_status="accepted", row_count=1,
+    )
+    org2_audit = PlanAudit.objects.create(
+        organization=org2, plan=org2_plan, summary_import=org2_import,
+        audit_name="Other organization synthetic audit", reporting_period="2026",
+        created_by=get_user_model().objects.get(username="audit-test-admin"),
+    )
 
     other_user = get_user_model().objects.create_user(username="other-org-user", password="test-password")
-    other_user.groups.add(client_group)
+    other_user.groups.add(client_group, rev_group)
     client.post(f"/api/v1/organizations/{org2_id}/users/", {"user_id": other_user.pk}, content_type="application/json")
 
     other_client = DjangoClient()
-    other_client.force_login(other_user)
+    mfa_force_login(other_client, other_user)
+    reviewer_orgs = rev_client.get("/api/v1/organizations/")
+    assert reviewer_orgs.status_code == 200
+    assert [item["id"] for item in reviewer_orgs.json()] == [org_id]
+    assert rev_client.get(f"/api/v1/plan-audits/{org2_audit.pk}/").status_code == 404
     # Attempting to access Org 1's audit from Org 2 user returns 404
     assert other_client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 404
+    unassigned_client_user = get_user_model().objects.create_user(
+        username="mk05-unassigned-client", password="test-password")
+    unassigned_client_user.groups.add(client_group)
+    unassigned_client = DjangoClient()
+    mfa_force_login(unassigned_client, unassigned_client_user)
+    assert unassigned_client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 404
+    assert not any(item["id"] == audit_id for item in unassigned_client.get("/api/v1/plan-audits/").json())
+    mixed_client_analyst = get_user_model().objects.create_user(
+        username="mk05-mixed-unassigned-analyst", password="test-password")
+    mixed_client_analyst.groups.add(client_group, analyst_group)
+    assert client.post(f"/api/v1/organizations/{org2_id}/users/",
+                       {"user_id": mixed_client_analyst.pk}, content_type="application/json").status_code in {200, 201}
+    mixed_client_analyst_client = DjangoClient()
+    mfa_force_login(mixed_client_analyst_client, mixed_client_analyst)
+    assert mixed_client_analyst_client.get(f"/api/v1/plan-audits/{audit_id}/").status_code == 404
+    assert not any(item["id"] == audit_id for item in mixed_client_analyst_client.get("/api/v1/plan-audits/").json())
+
+    # Independent MK-03 lifecycle with the requested exact v1 -> reject -> v2 sequence.
+    monkeypatch.setattr(plan_audit_run, "run_plan_audit", validated_fixture_engine)
+    lifecycle_created = client.post("/api/v1/plan-audits/create/", {
+        "organization_id": org_id, "plan_id": plan_id, "summary_import_id": import_id,
+        "audit_name": "MK-03 isolated publication lifecycle", "reporting_period": "2026-01-01/2026-12-31",
+    }, content_type="application/json")
+    assert lifecycle_created.status_code == 201, lifecycle_created.content
+    lifecycle_id = lifecycle_created.json()["id"]
+    lifecycle_run = client.post(f"/api/v1/plan-audits/{lifecycle_id}/run/")
+    assert lifecycle_run.status_code == 200, lifecycle_run.content
+    assert lifecycle_run.json()["current_version"] == 1
+    lifecycle_audit = PlanAudit.objects.get(pk=lifecycle_id)
+    lifecycle_version1 = current_audit_run(lifecycle_audit)
+    lifecycle_binding = {"version": lifecycle_version1.version,
+                         "result_fingerprint": lifecycle_version1.result_fingerprint}
+    assert client.post(f"/api/v1/plan-audits/{lifecycle_id}/generate-report/").status_code == 200
+    lifecycle_approval = rev_client.post(f"/api/v1/plan-audits/{lifecycle_id}/approve/", {
+        "comments": "Version 1 independently approved.", **lifecycle_binding,
+    }, content_type="application/json")
+    assert lifecycle_approval.status_code == 200
+    assert lifecycle_approval.json()["version"] == 1
+    assert client_test_client.get(f"/api/v1/plan-audits/{lifecycle_id}/results/").status_code == 200
+    assert client_test_client.get(f"/api/v1/plan-audits/{lifecycle_id}/report/").status_code == 200
+    assert client_test_client.get(f"/api/v1/plan-audits/{lifecycle_id}/export-csv/").status_code == 200
+
+    unauthorized_reviewer = get_user_model().objects.create_user(
+        username="mk03-unassigned-reviewer", password="test-password")
+    unauthorized_reviewer.groups.add(rev_group)
+    unauthorized_reviewer_client = DjangoClient()
+    mfa_force_login(unauthorized_reviewer_client, unauthorized_reviewer)
+    reject_reason_with_financial_data = "Do not publish; internal allowed total $123456.78."
+    reject_payload = {"comments": reject_reason_with_financial_data, **lifecycle_binding}
+    assert unauthorized_reviewer_client.post(
+        f"/api/v1/plan-audits/{lifecycle_id}/reject/", reject_payload,
+        content_type="application/json").status_code == 404
+    assert unauthorized_reviewer_client.post(
+        f"/api/v1/plan-audits/{lifecycle_id}/approve/", lifecycle_binding,
+        content_type="application/json").status_code == 404
+    assert other_client.post(f"/api/v1/plan-audits/{lifecycle_id}/reject/", reject_payload,
+                             content_type="application/json").status_code == 404
+    assert other_client.post(f"/api/v1/plan-audits/{lifecycle_id}/approve/", lifecycle_binding,
+                             content_type="application/json").status_code == 404
+    assert rev_b_client.post(f"/api/v1/plan-audits/{lifecycle_id}/reject/", {
+        "comments": "   ", **lifecycle_binding,
+    }, content_type="application/json").status_code == 400
+    assert rev_b_client.post(f"/api/v1/plan-audits/{lifecycle_id}/reject/", {
+        "comments": "Stale version identifier.", "version": 0,
+        "result_fingerprint": lifecycle_binding["result_fingerprint"],
+    }, content_type="application/json").status_code == 409
+
+    lifecycle_rejection = rev_b_client.post(
+        f"/api/v1/plan-audits/{lifecycle_id}/reject/", reject_payload,
+        content_type="application/json")
+    assert lifecycle_rejection.status_code == 200, lifecycle_rejection.content
+    assert lifecycle_rejection.json()["published_version"] is None
+    for suffix in ("overview/", "results/", "report/", "export-csv/", "savings/", "quality/"):
+        assert client_test_client.get(f"/api/v1/plan-audits/{lifecycle_id}/{suffix}").status_code == 404
+    client_lifecycle_metadata = next(
+        item for item in client_test_client.get("/api/v1/plan-audits/").json()
+        if item["id"] == lifecycle_id)
+    assert client_lifecycle_metadata["publication_status"] == "rejected"
+    assert client_lifecycle_metadata["summary"] == {}
+    assert client_lifecycle_metadata["result_fingerprint"] is None
+    assert client_lifecycle_metadata["latest_publication_decision"]["reviewer"] == rev_b_user.username
+    assert client_lifecycle_metadata["latest_publication_decision"]["reason"] is None
+    assert reject_reason_with_financial_data not in str(client_lifecycle_metadata)
+    lifecycle_history = rev_client.get(f"/api/v1/plan-audits/{lifecycle_id}/review/")
+    assert lifecycle_history.status_code == 200
+    assert [entry["review_status"] for entry in lifecycle_history.json()] == ["rejected", "approved"]
+    assert lifecycle_history.json()[0]["comments"] == reject_reason_with_financial_data
+    assert rev_client.post(f"/api/v1/plan-audits/{lifecycle_id}/approve/", {
+        "comments": "Cannot reuse v1 approval.", **lifecycle_binding,
+    }, content_type="application/json").status_code == 409
+
+    lifecycle_v2_response = client.post(f"/api/v1/plan-audits/{lifecycle_id}/run/")
+    assert lifecycle_v2_response.status_code == 200, lifecycle_v2_response.content
+    assert lifecycle_v2_response.json()["current_version"] == 2
+    for suffix in ("results/", "report/", "export-csv/"):
+        assert client_test_client.get(f"/api/v1/plan-audits/{lifecycle_id}/{suffix}").status_code == 404
+    lifecycle_audit.refresh_from_db()
+    lifecycle_version2 = current_audit_run(lifecycle_audit)
+    lifecycle_v2_binding = {"version": lifecycle_version2.version,
+                             "result_fingerprint": lifecycle_version2.result_fingerprint}
+    assert client.post(f"/api/v1/plan-audits/{lifecycle_id}/generate-report/").status_code == 200
+    lifecycle_v2_approval = rev_client.post(f"/api/v1/plan-audits/{lifecycle_id}/approve/", {
+        "comments": "Version 2 independently approved after v1 rejection.", **lifecycle_v2_binding,
+    }, content_type="application/json")
+    assert lifecycle_v2_approval.status_code == 200
+    assert lifecycle_v2_approval.json()["version"] == 2
+    assert client_test_client.get(f"/api/v1/plan-audits/{lifecycle_id}/results/").status_code == 200
+    assert client_test_client.get(f"/api/v1/plan-audits/{lifecycle_id}/report/").status_code == 200
+    assert client_test_client.get(f"/api/v1/plan-audits/{lifecycle_id}/export-csv/").status_code == 200
+    revoke = client.delete(f"/api/v1/organizations/{org_id}/users/{rev_user.pk}/")
+    assert revoke.status_code == 204
+    assert rev_client.get("/api/v1/organizations/").json() == []
+    assert rev_client.get(f"/api/v1/plan-audits/{lifecycle_id}/").status_code == 404
+    assert rev_client.post(f"/api/v1/plan-audits/{lifecycle_id}/approve/", {
+        "comments": "Access was revoked.", **lifecycle_v2_binding,
+    }, content_type="application/json").status_code == 404
+
+
+@pytest.mark.django_db
+def test_mk05_actual_role_classification_matrix(client, db):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from django.test import Client as DjangoClient
+    from pricing.plan_audit_common import is_client_only, is_admin
+
+    User = get_user_model()
+    groups = {
+        name: Group.objects.get_or_create(name=name)[0]
+        for name in ("CLIENT", "Viewer", "SUPER_ADMIN", "ANALYST", "REVIEWER")
+    }
+
+    def make_user(username, role_names=(), *, superuser=False, active=True):
+        account = User.objects.create_user(username=username, password="test-password",
+                                           is_superuser=superuser, is_staff=superuser,
+                                           is_active=active)
+        if role_names:
+            account.groups.add(*(groups[name] for name in role_names))
+        return account
+
+    cases = [
+        (make_user("mk05-su-no-groups", superuser=True), False, True),
+        (make_user("mk05-su-client", ("CLIENT",), superuser=True), False, True),
+        (make_user("mk05-super-admin-group", ("SUPER_ADMIN",)), False, True),
+        (make_user("mk05-analyst", ("ANALYST",)), False, False),
+        (make_user("mk05-reviewer", ("REVIEWER",)), False, False),
+        (make_user("mk05-client", ("CLIENT",)), True, False),
+        (make_user("mk05-viewer", ("Viewer",)), True, False),
+        (make_user("mk05-client-reviewer", ("CLIENT", "REVIEWER")), False, False),
+        (make_user("mk05-client-analyst", ("CLIENT", "ANALYST")), False, False),
+        (make_user("mk05-no-role"), False, False),
+        (make_user("mk05-inactive-client", ("CLIENT",), active=False), True, False),
+    ]
+    for account, expected_client_only, expected_admin in cases:
+        assert is_client_only(account) is expected_client_only, account.username
+        assert is_admin(account) is expected_admin, account.username
+
+    superuser_no_groups = cases[0][0]
+    # Superuser permission inheritance remains broad; classification helper excludes it from CLIENT-only.
+    from pricing.permissions import has_any_role
+    assert has_any_role(superuser_no_groups, {"CLIENT"})
+    assert has_any_role(superuser_no_groups, {"REVIEWER"})
+    assert not has_any_role(cases[9][0], {"CLIENT", "Viewer", "ANALYST", "REVIEWER"})
+
+    no_role_client = DjangoClient()
+    mfa_force_login(no_role_client, cases[9][0])
+    assert no_role_client.get("/api/v1/plan-audits/").status_code == 403
+    inactive_client = DjangoClient()
+    mfa_force_login(inactive_client, cases[10][0])
+    assert inactive_client.get("/api/v1/plan-audits/").status_code == 401
+    for account, _, _ in cases[:9]:
+        role_client = DjangoClient()
+        mfa_force_login(role_client, account)
+        assert role_client.get("/api/v1/plan-audits/").status_code == 200, account.username
+
+
+def test_audit_result_and_savings_admin_is_read_only():
+    from django.contrib import admin
+    from pricing.models import PlanAudit, PlanAuditArtifact, PlanAuditResult, PlanAuditRun, SavingsOpportunity
+
+    assert "created_by" in admin.site._registry[PlanAudit].get_readonly_fields(None)
+    assert PlanAuditRun not in admin.site._registry
+    assert PlanAuditArtifact not in admin.site._registry
+
+    for model in (PlanAuditResult, SavingsOpportunity):
+        model_admin = admin.site._registry[model]
+        request = None
+        # The permission methods are unconditional and do not depend on request data.
+        assert model_admin.has_add_permission(request) is False
+        assert model_admin.has_change_permission(request) is False
+        assert model_admin.has_delete_permission(request) is False
+        assert set(model_admin.get_readonly_fields(request)) == {
+            field.name for field in model._meta.fields
+        }
 
 
 def test_evaluation_package_and_broker_evaluations_workflow(client):
@@ -1255,7 +1944,7 @@ def test_evaluation_package_and_broker_evaluations_workflow(client):
     viewer_user = get_user_model().objects.create_user(username="viewer-eval-test", password="test-password")
     viewer_user.groups.add(viewer_group)
     viewer_client = DjangoClient()
-    viewer_client.force_login(viewer_user)
+    mfa_force_login(viewer_client, viewer_user)
 
     viewer_pkg = viewer_client.get("/api/v1/reports/evaluation-package/")
     assert viewer_pkg.status_code == 403
@@ -1479,4 +2168,310 @@ def test_synthea_subtable_queries_and_privacy(client):
     assert detail["encounter"]["Id"] == sample_enc_id
     assert "procedures" in detail
     assert "medications" in detail
+
+
+@pytest.mark.django_db
+def test_mk07_reviewer_clinical_unit_validation_access(client, tmp_path, monkeypatch):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from django.test import Client as DjangoClient
+    from pipeline.common import paths as project_paths
+
+    User = get_user_model()
+    reviewer = User.objects.create_user(username="mk07-reviewer", password="test-password")
+    reviewer.groups.add(Group.objects.get_or_create(name="REVIEWER")[0])
+    reviewer_client = mfa_force_login(DjangoClient(), reviewer)
+    analyst = User.objects.create_user(username="mk07-analyst", password="test-password")
+    analyst.groups.add(Group.objects.get_or_create(name="ANALYST")[0])
+    analyst_client = mfa_force_login(DjangoClient(), analyst)
+    client_user = User.objects.create_user(username="mk07-client", password="test-password")
+    client_user.groups.add(Group.objects.get_or_create(name="CLIENT")[0])
+    client_role_client = mfa_force_login(DjangoClient(), client_user)
+
+    def isolated_paths():
+        configured = project_paths()
+        configured["raw"] = tmp_path / "review-export"
+        return configured
+
+    monkeypatch.setattr("pipeline.common.paths", isolated_paths)
+    validation_path = "/api/v1/drug-unit-validations/"
+    scope_path = "/api/v1/drug-selection-scope/"
+    reviewer_validation = reviewer_client.get(validation_path)
+    reviewer_scope = reviewer_client.get(scope_path)
+    assert (reviewer_validation.status_code, reviewer_scope.status_code) == (200, 200), {
+        "validations": reviewer_validation.status_code, "scope": reviewer_scope.status_code,
+    }
+    assert reviewer_validation.json()["status"] == "loaded"
+    assert "rows" in reviewer_validation.json()
+    assert all(not {"price", "asp_payment_limit", "markup_multiple"}.intersection(row)
+               for row in reviewer_validation.json()["rows"])
+    assert reviewer_scope.json()["status"] == "selected"
+    drug = next(item for item in reviewer_scope.json()["drugs"]
+                if item.get("billing_unit") and item.get("asp_dosage"))
+    assert all("partb_spending" not in item and "spend_rank" not in item
+               for item in reviewer_scope.json()["drugs"])
+    review_url = f"/api/v1/drug-selection-scope/{drug['hcpcs']}/unit-review/"
+    bad_quantity = reviewer_client.post(review_url, {
+        "status": "unit_unresolved", "notes": "Synthetic test evidence is incomplete.",
+        "clinical_reviewer_name": "Synthetic Test Reviewer",
+        "billing_qty": "999", "billing_unit": drug["billing_unit"]["unit"],
+    }, content_type="application/json")
+    assert bad_quantity.status_code == 400
+    missing_evidence = reviewer_client.post(review_url, {
+        "status": "unit_unresolved", "notes": "short",
+        "clinical_reviewer_name": "Synthetic Test Reviewer",
+        "billing_qty": drug["billing_unit"]["qty"], "billing_unit": drug["billing_unit"]["unit"],
+    }, content_type="application/json")
+    assert missing_evidence.status_code == 400
+    saved = reviewer_client.post(review_url, {
+        "status": "unit_unresolved", "notes": "Synthetic test evidence; keep this unit unresolved.",
+        "clinical_reviewer_name": "Synthetic Test Reviewer",
+        "billing_qty": drug["billing_unit"]["qty"], "billing_unit": drug["billing_unit"]["unit"],
+    }, content_type="application/json")
+    assert saved.status_code == 200, saved.content
+    assert saved.json()["reviewer"] == "mk07-reviewer"
+    refreshed_scope = reviewer_client.get(scope_path).json()
+    reviewed_drug = next(item for item in refreshed_scope["drugs"] if item["hcpcs"] == drug["hcpcs"])
+    assert reviewed_drug["unit_review"]["status"] == "unit_unresolved"
+    assert reviewed_drug["unit_review"]["notes"] == "Synthetic test evidence; keep this unit unresolved."
+    assert reviewed_drug["unit_review"]["clinical_reviewer_name"] == "Synthetic Test Reviewer"
+    assert reviewed_drug["unit_review"]["reviewer__username"] == "mk07-reviewer"
+    assert reviewed_drug["unit_review"]["scope_source_sha256"] == refreshed_scope["source_sha256"]
+
+    for role_client in (client_role_client, analyst_client):
+        assert role_client.get(validation_path).status_code == 403
+        assert role_client.get(scope_path).status_code == 403
+    assert client_role_client.post(review_url, saved.json(), content_type="application/json").status_code == 403
+    assert analyst_client.post(review_url, saved.json(), content_type="application/json").status_code == 403
+    assert client.get(validation_path).status_code == 200
+    admin_scope = client.get(scope_path)
+    assert admin_scope.status_code == 200
+    admin_review = next(item for item in admin_scope.json()["drugs"] if item["hcpcs"] == drug["hcpcs"])
+    assert admin_review["unit_review"]["status"] == "unit_unresolved"
+    assert reviewer_client.get("/api/v1/application-settings/").status_code == 403
+    assert reviewer_client.get("/api/v1/audit-logs/").status_code == 403
+    anonymous = DjangoClient()
+    assert anonymous.get(validation_path).status_code == 401
+    assert anonymous.get(scope_path).status_code == 401
+
+
+@pytest.mark.django_db
+def test_mk08_drug_analysis_uses_only_compatible_detailed_benchmarks(client):
+    from decimal import Decimal
+    from django.contrib.auth import get_user_model
+    from django.utils import timezone
+    from pricing.models import (ClaimsSummaryImport, ClaimsSummaryRecord, Plan, PlanAudit,
+                                PlanAuditResult, PlanAuditRun, PlanOrganization)
+
+    creator = get_user_model().objects.get(username="audit-test-admin")
+    organization = PlanOrganization.objects.create(organization_name="MK08 Synthetic Org",
+                                                   organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Synthetic plan",
+                              plan_reference="MK08-PLAN")
+    summary_import = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="synthetic-summary.csv",
+        file_hash="b" * 64, schema_version="test-v1", import_status="accepted")
+    audit = PlanAudit.objects.create(organization=organization, plan=plan, summary_import=summary_import,
+                                     audit_name="Synthetic benchmark aggregation", reporting_period="2026",
+                                     created_by=creator, status="running")
+    selection_hash = "d" * 64
+
+    def create_run(version, fixtures):
+        run = PlanAuditRun.objects.create(
+            plan_audit=audit, version=version, calculation_status="running", publication_status="pending",
+            summary_import=summary_import, initiated_by=creator, started_at=timezone.now())
+        records = [ClaimsSummaryRecord(
+            summary_import=summary_import, plan_reference="MK08-PLAN", hcpcs_code="J9999", site_npi=row[1],
+            quarter=row[0], service_setting="outpatient", total_units=Decimal(row[2]),
+            total_allowed_amount=Decimal(row[3]), total_paid_amount=Decimal(row[4]), member_count_band="11-50",
+            source_period=row[0], extraction_timestamp=timezone.now(), schema_version="test-v1")
+            for row in fixtures]
+        ClaimsSummaryRecord.objects.bulk_create(records)
+        results = []
+        for source, row in zip(records, fixtures):
+            quarter, _npi, units, allowed, paid, asp, allowed_multiple, paid_multiple, quality, review_status, review_hash, asp_hash = row
+            refs = {"unit_review_status": review_status,
+                    "unit_review_source_sha256": review_hash or None,
+                    "unit_review_billing_qty": "1" if review_status == "validated" else None,
+                    "unit_review_billing_unit": ("VIAL" if source.site_npi.endswith("9") else "MG")
+                                                  if review_status == "validated" else None,
+                    "drug_selection_source_sha256": selection_hash,
+                    "asp_source_sha256": asp_hash or None,
+                    "asp_source_file": f"{quarter}.csv" if asp_hash else None}
+            results.append(PlanAuditResult(
+                plan_audit=audit, audit_run=run, summary_record=source, hcpcs_code="J9999",
+                site_npi=source.site_npi, quarter=quarter, service_setting="outpatient",
+                total_units=Decimal(units), total_allowed_amount=Decimal(allowed), total_paid_amount=Decimal(paid),
+                member_count_band="11-50", plan_allowed_price_per_unit=Decimal(allowed) / Decimal(units),
+                plan_paid_price_per_unit=Decimal(paid) / Decimal(units),
+                asp_payment_limit=Decimal(asp) if asp is not None else None,
+                allowed_markup_multiple=Decimal(allowed_multiple) if allowed_multiple is not None else None,
+                paid_markup_multiple=Decimal(paid_multiple) if paid_multiple is not None else None,
+                data_quality_status=quality, data_quality_notes=[], source_references=refs))
+        PlanAuditResult.objects.bulk_create(results)
+        run.calculation_status = "completed"
+        run.completed_at = timezone.now()
+        run.save(update_fields=["calculation_status", "completed_at"])
+        audit.current_version = version
+        audit.status = "completed"
+        audit.save(update_fields=["current_version", "status"])
+        return run, results
+
+    unresolved_fixture = [
+        ("2026Q1", "1000000001", "10", "100", "80", "2", None, None,
+         "UNIT_UNRESOLVED", "unresolved", "", "1" * 64),
+    ]
+    run1, immutable_results = create_run(1, unresolved_fixture)
+    before = client.get(f"/api/v1/plan-audits/{audit.pk}/drug-analysis/")
+    assert before.status_code == 200
+    assert before.json()["results"][0]["allowed_markup_multiple"] is None, before.json()["results"][0]
+    assert before.json()["results"][0]["paid_markup_multiple"] is None
+
+    fixtures = [
+        ("2026Q1", "1000000002", "10", "100", "80", "2", "5", "4", "VALID", "validated", "c" * 64, "1" * 64),
+        ("2026Q1", "1000000003", "10", "300", "240", "2", "15", "12", "NETWORK_UNVERIFIED", "validated", "c" * 64, "1" * 64),
+        ("2026Q1", "1000000004", "10", "100", "80", "2", None, None, "UNIT_UNRESOLVED", "unresolved", "", "1" * 64),
+        ("2026Q1", "1000000010", "5", "50", "40", "2", None, None, "NETWORK_UNVERIFIED", "validated", "c" * 64, "1" * 64),
+        ("2026Q2", "1000000005", "10", "150", "100", "3", "5", "3.33333333", "NETWORK_UNVERIFIED", "validated", "c" * 64, "2" * 64),
+        ("2026Q3", "1000000006", "10", "100", "80", None, None, None, "REFERENCE_NOT_FOUND", "validated", "c" * 64, ""),
+        ("2026Q4", "1000000007", "10", "100", "80", "0", None, None, "REFERENCE_NOT_FOUND", "validated", "c" * 64, "4" * 64),
+        ("2025Q4", "1000000008", "10", "100", "80", "2", "5", "4", "VALID", "validated", "e" * 64, "5" * 64),
+        ("2025Q4", "1000000009", "10", "100", "80", "2", "5", "4", "VALID", "validated", "e" * 64, "5" * 64),
+    ]
+    run2, _ = create_run(2, fixtures)
+    response = client.get(f"/api/v1/plan-audits/{audit.pk}/drug-analysis/")
+    assert response.status_code == 200
+    result = response.json()["results"][0]
+    assert result["allowed_markup_multiple"] is None
+    assert result["paid_markup_multiple"] is None
+    assert result["quarters"] == ["2025Q4", "2026Q1", "2026Q2", "2026Q3", "2026Q4"]
+    assert result["quarter_breakdown"]["2026Q1"]["allowed_markup_multiple"] == "10"
+    assert result["quarter_breakdown"]["2026Q1"]["paid_markup_multiple"] == "8"
+    assert result["quarter_breakdown"]["2026Q1"]["eligible_row_count"] == 2
+    assert result["quarter_breakdown"]["2026Q1"]["excluded_row_count"] == 2
+    assert result["quarter_breakdown"]["2026Q2"]["allowed_markup_multiple"] == "5"
+    assert Decimal(result["quarter_breakdown"]["2026Q2"]["paid_markup_multiple"]) == (
+        Decimal("100") / (Decimal("10") * Decimal("3")))
+    assert result["quarter_breakdown"]["2026Q3"]["allowed_markup_multiple"] is None
+    assert result["quarter_breakdown"]["2026Q4"]["allowed_markup_multiple"] is None
+    assert result["quarter_breakdown"]["2025Q4"]["allowed_markup_multiple"] is None
+    assert Decimal(result["visible_allowed_amount"]) == Decimal("1100")
+    assert Decimal(result["eligible_allowed_amount"]) == Decimal("550")
+    assert Decimal(result["excluded_allowed_amount"]) == Decimal("550")
+    assert result["excluded_row_count"] == 6
+    assert Decimal(result["excluded_total_units"]) == Decimal("55")
+    assert Decimal(result["eligible_allowed_amount"]) + Decimal(result["excluded_allowed_amount"]) == Decimal(
+        result["visible_allowed_amount"])
+    assert Decimal(result["eligible_paid_amount"]) + Decimal(result["excluded_paid_amount"]) == Decimal(
+        result["visible_paid_amount"])
+    assert Decimal(result["eligible_total_units"]) + Decimal(result["excluded_total_units"]) == Decimal(
+        result["total_units"])
+    assert Decimal(result["eligible_allowed_units"]) + Decimal(result["excluded_allowed_units"]) == Decimal(
+        result["total_units"])
+    assert Decimal(result["eligible_paid_units"]) + Decimal(result["excluded_paid_units"]) == Decimal(
+        result["total_units"])
+    assert result == client.get(f"/api/v1/plan-audits/{audit.pk}/drug-analysis/").json()["results"][0]
+
+    assert run1.pk != run2.pk
+    assert immutable_results[0].allowed_markup_multiple is None
+    immutable_results[0].refresh_from_db()
+    assert immutable_results[0].allowed_markup_multiple is None
+    audit.current_version = 1
+    audit.save(update_fields=["current_version"])
+    assert client.get(f"/api/v1/plan-audits/{audit.pk}/drug-analysis/").json()["results"][0][
+        "allowed_markup_multiple"] is None
+
+
+def test_mk09_network_status_requires_consistent_full_quarter_coverage(monkeypatch):
+    from datetime import date
+    from decimal import Decimal
+    from itertools import permutations
+    from types import SimpleNamespace
+    from pricing import plan_audit_engine as engine
+
+    def roster(start, end, status, *, npi="1000000002", name="Choice Network", location="Clinic A",
+               plan_id=1):
+        return SimpleNamespace(provider_npi=npi, network_name=name, service_location=location,
+                               network_status=status, effective_start=date.fromisoformat(start),
+                               effective_end=date.fromisoformat(end) if end else None,
+                               source_hash=("a" if status == "in_network" else "b") * 64,
+                               plan_id=plan_id)
+
+    q1_in = roster("2026-01-01", None, "in_network")
+    q1_out = roster("2026-01-01", "2026-03-31", "out_of_network")
+    assert engine.network_status_for([q1_in], "1000000002", "2026Q1") == "IN_NETWORK"
+    assert engine.network_status_for([q1_out], "1000000002", "2026Q1") == "OUT_OF_NETWORK"
+    partial_out = roster("2026-02-01", "2026-02-28", "out_of_network")
+    partial_in = roster("2026-02-01", "2026-02-28", "in_network")
+    current = SimpleNamespace(hcpcs_code="J9999", site_npi="1000000001", quarter="2026Q1",
+                              service_setting="outpatient", total_units=Decimal("10"))
+    alternative = SimpleNamespace(hcpcs_code="J9999", site_npi="1000000002", quarter="2026Q1",
+                                  service_setting="outpatient", total_units=Decimal("10"))
+    result_by_key = {
+        (row.hcpcs_code, row.site_npi, row.quarter, row.service_setting):
+            (row, SimpleNamespace(plan_allowed_price_per_unit=Decimal(price),
+                                  plan_paid_price_per_unit=Decimal(price)), True)
+        for row, price in ((current, "100"), (alternative, "50"))
+    }
+    monkeypatch.setattr(engine, "SavingsOpportunity", lambda **values: values)
+    audit = SimpleNamespace(summary_import=SimpleNamespace(file_hash="c" * 64))
+    assert engine._build_opportunities(
+        audit, object(), [current, alternative], result_by_key, [q1_in, partial_out]) == []
+    assert engine._roster_source_hashes([q1_in, partial_out], "1000000002", "2026Q1") == sorted(
+        [q1_in.source_hash, partial_out.source_hash])
+    assert engine.network_status_for([q1_in, partial_out], "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    assert engine.network_status_for([q1_out, partial_in], "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    for status, expected in (("in_network", "IN_NETWORK"), ("out_of_network", "OUT_OF_NETWORK")):
+        overlap = [roster("2026-01-01", "2026-02-15", status),
+                   roster("2026-02-01", "2026-03-31", status)]
+        adjacent = [roster("2026-01-01", "2026-01-31", status),
+                    roster("2026-02-01", "2026-02-28", status),
+                    roster("2026-03-01", "2026-03-31", status)]
+        assert engine.network_status_for(overlap, "1000000002", "2026Q1") == expected
+        assert engine.network_status_for(adjacent, "1000000002", "2026Q1") == expected
+    gap = [roster("2026-01-01", "2026-01-31", "in_network"),
+           roster("2026-03-01", "2026-03-31", "in_network")]
+    feb_only = [roster("2026-02-01", "2026-02-28", "in_network")]
+    assert engine.network_status_for(gap, "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    assert engine.network_status_for(feb_only, "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    expired = [roster("2025-01-01", "2025-12-31", "in_network")]
+    assert engine.network_status_for(expired, "1000000002", "2026Q1") == "NETWORK_DATA_EXPIRED"
+    assert engine.network_status_for([q1_in], "1000000002", "2026Q1") == "IN_NETWORK"
+    assert engine.network_status_for([q1_in, partial_out], "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    assert engine.network_status_for([roster("2026-01-01", "2026-03-31", "in_network")],
+                                     "1000000002", "2026Q1") == "IN_NETWORK"
+    leap_q1 = [roster("2024-01-01", "2024-03-31", "in_network")]
+    assert engine.network_status_for(leap_q1, "1000000002", "2024Q1") == "IN_NETWORK"
+    assert engine.network_status_for([roster("2025-10-01", "2025-12-31", "out_of_network")],
+                                     "1000000002", "2025Q4") == "OUT_OF_NETWORK"
+    assert engine.network_status_for([roster("2026-01-01", "2026-03-31", "in_network")],
+                                     "1000000002", "2026Q1") == "IN_NETWORK"
+    assert engine.network_status_for([roster("2025-10-01", "2025-12-31", "out_of_network")],
+                                     "1000000002", "2026Q1") == "NETWORK_DATA_EXPIRED"
+    assert engine.network_status_for([roster("2025-12-31", "2026-01-01", "in_network")],
+                                     "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    assert engine.network_status_for([q1_in, partial_out, roster("2026-02-10", "2026-02-20", "out_of_network")],
+                                     "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    assert engine.network_status_for([q1_in], "1000000003", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    plan_a = [roster("2026-01-01", "2026-03-31", "in_network", plan_id=1)]
+    plan_b = [roster("2026-01-01", "2026-03-31", "out_of_network", plan_id=2)]
+    assert engine.network_status_for(plan_a, "1000000002", "2026Q1") == "IN_NETWORK"
+    assert engine.network_status_for(plan_b, "1000000002", "2026Q1") == "OUT_OF_NETWORK"
+    assert engine.network_status_for(plan_a + plan_b, "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    assert engine.network_status_for([roster("2026-01-01", "2026-03-31", "in_network", name="A"),
+                                      roster("2026-01-01", "2026-03-31", "in_network", name="B")],
+                                     "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    assert engine.network_status_for([roster("2026-01-01", "2026-03-31", "in_network", location="")],
+                                     "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    assert engine.network_status_for([roster("2026-01-01", "2026-03-31", "in_network", location="Clinic A"),
+                                      roster("2026-01-01", "2026-03-31", "in_network", location="Clinic B")],
+                                     "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+    for ordered in permutations([q1_in, partial_out]):
+        assert engine.network_status_for(ordered, "1000000002", "2026Q1") == "NETWORK_STATUS_UNKNOWN"
+
+    verified_opportunities = engine._build_opportunities(
+        audit, object(), [current, alternative], result_by_key, [q1_in])
+    assert len(verified_opportunities) == 1
+    assert verified_opportunities[0]["network_status"] == "IN_NETWORK"
+    assert verified_opportunities[0]["source_references"]["network_roster_file_hashes"] == [q1_in.source_hash]
 

@@ -25,6 +25,7 @@ const money = (value) => {
 const count = (value) => (value == null ? "—" : Number(value).toLocaleString("en-US"));
 const multiple = (value) =>
   value == null || !Number.isFinite(Number(value)) ? "—" : `${Number(value).toFixed(2)}×`;
+const benchmarkMultiple = (value) => value == null ? "Not comparable" : multiple(value);
 const pct = (value) =>
   value == null || !Number.isFinite(Number(value)) ? "—" : `${(Number(value) * 100).toFixed(1)}%`;
 
@@ -626,8 +627,8 @@ function DrugCostSection({ auditId, audit }) {
                     <td>{money(row.plan_allowed_price_per_unit)}</td>
                     <td>{money(row.plan_paid_price_per_unit)}</td>
                     <td>{money(row.asp_payment_limit)}</td>
-                    <td>{multiple(row.allowed_markup_multiple)}</td>
-                    <td>{multiple(row.paid_markup_multiple)}</td>
+                    <td>{benchmarkMultiple(row.allowed_markup_multiple)}</td>
+                    <td>{benchmarkMultiple(row.paid_markup_multiple)}</td>
                     <td>
                       {row.hospital_price_per_unit != null ? (
                         <>
@@ -836,7 +837,7 @@ function SavingsSection({ auditId, audit }) {
 // ---------------------------------------------------------------------------
 // Section: Audit Review and Reports
 // ---------------------------------------------------------------------------
-function ReviewReportsSection({ auditId, audit, reviews, quality, reviewer, analyst, busy, onRefresh }) {
+function ReviewReportsSection({ auditId, audit, reviews, quality, reviewer, analyst, admin, user, busy, onRefresh }) {
   const [reviewComment, setReviewComment] = useState("");
   const [localError, setLocalError] = useState("");
   const [localNotice, setLocalNotice] = useState("");
@@ -849,7 +850,33 @@ function ReviewReportsSection({ auditId, audit, reviews, quality, reviewer, anal
     finally { setLocalBusy(false); }
   }
 
-  const canAct = !busy && !localBusy && ["completed", "needs_review"].includes(audit?.status);
+  const canAct = !busy && !localBusy && ["completed", "needs_review"].includes(audit?.status)
+    && Boolean(audit?.result_fingerprint);
+  const reviewBinding = { version: audit?.current_version, result_fingerprint: audit?.result_fingerprint };
+  const currentUserId = user?.id == null ? "" : String(user.id);
+  const contributorIds = [audit?.created_by_id, audit?.run_initiated_by_id,
+    ...(audit?.artifact_builders || []).map((builder) => builder.id)];
+  const isCreatorOrRunner = Boolean(currentUserId && [audit?.created_by_id, audit?.run_initiated_by_id]
+    .some((id) => id != null && String(id) === currentUserId));
+  const isArtifactBuilder = Boolean(currentUserId && (audit?.artifact_builders || [])
+    .some((builder) => builder.id != null && String(builder.id) === currentUserId));
+  const contributorIdentityMissing = !audit?.created_by_id || !audit?.run_initiated_by_id
+    || audit?.artifact_builders?.length !== 2 || audit.artifact_builders.some((builder) => builder.id == null);
+  const currentUserContributed = Boolean(currentUserId && contributorIds
+    .some((id) => id != null && String(id) === currentUserId));
+  const latestDecision = reviews.find((item) => ["approved", "rejected"].includes(item.review_status))
+    || (audit?.latest_publication_decision ? {
+      review_status: audit.latest_publication_decision.status,
+      reviewer: audit.latest_publication_decision.reviewer,
+      reviewed_at: audit.latest_publication_decision.reviewed_at,
+      comments: audit.latest_publication_decision.reason,
+    } : null);
+  const publicationLabel = audit?.publication_status === "published" ? "Published" :
+    audit?.publication_status === "rejected" ? "Rejected — publication revoked" :
+      audit?.publication_status === "revoked" ? "Revoked — publication suspended" :
+        audit?.publication_status === "failed" || audit?.calculation_status === "failed" ? "Failed — not publishable" :
+          audit?.calculation_status === "running" ? "Running" :
+            audit?.calculation_status === "completed" ? "Pending Approval" : audit?.calculation_status || "Not started";
 
   return (
     <div>
@@ -860,12 +887,37 @@ function ReviewReportsSection({ auditId, audit, reviews, quality, reviewer, anal
       {audit && (
         <section className="dashboard-panel">
           <h3 className="panel-title">Report actions</h3>
+          <p className="muted" role="status">
+            Run v{audit.current_version || 0}: {publicationLabel}
+          </p>
+          {(reviewer || analyst || admin) && (
+            <div className="muted">
+              <p>Audit creator: {audit.created_by || "Unknown"}; run initiator: {audit.run_initiated_by || "Unknown"}.</p>
+              <p>Report builders: {(audit.artifact_builders || []).map((builder) => builder.username || "Unknown").join(", ") || "Unknown"}.</p>
+            </div>
+          )}
+          {latestDecision && (
+            <p className="muted" role="status">
+              Latest decision: {latestDecision.review_status} by {latestDecision.reviewer || "Reviewer"}
+              {latestDecision.reviewed_at ? ` on ${latestDecision.reviewed_at}` : ""}
+              {latestDecision.comments ? ` — ${latestDecision.comments}` : ""}
+            </p>
+          )}
+          {!audit.can_view_results && !analyst && !reviewer && (
+            <p className="muted">
+              {audit.publication_status === "rejected"
+                ? "A reviewer rejected this run and revoked publication. Results remain unavailable until a new run is approved."
+                : audit.publication_status === "failed"
+                  ? "This calculation failed and cannot be published. Results and downloads are unavailable."
+                  : "Updated report pending independent review. Results and downloads are unavailable until approval."}
+            </p>
+          )}
           <div className="plan-audit-actions">
             {analyst && (
               <button
                 type="button"
                 className="secondary"
-                disabled={!canAct}
+                disabled={!canAct || audit.publication_status === "rejected" || audit.publication_status === "failed"}
                 onClick={() => act(async () => {
                   await postJSON(`plan-audits/${auditId}/generate-report/`);
                   await downloadFile(`plan-audits/${auditId}/report/`, `plan-audit-${auditId}.pdf`);
@@ -874,10 +926,23 @@ function ReviewReportsSection({ auditId, audit, reviews, quality, reviewer, anal
                 Generate and download PDF
               </button>
             )}
+            {audit.can_download_report && (
+              <button
+                type="button"
+                className="secondary"
+                disabled={busy || localBusy}
+                onClick={() => act(
+                  () => downloadFile(`plan-audits/${auditId}/report/`, `plan-audit-${auditId}.pdf`),
+                  "Approved PDF downloaded."
+                )}
+              >
+                Download approved PDF
+              </button>
+            )}
             <button
               type="button"
               className="secondary"
-              disabled={busy || localBusy}
+              disabled={busy || localBusy || !audit.can_download_csv}
               onClick={() => act(
                 () => downloadFile(`plan-audits/${auditId}/export-csv/`, `plan-audit-${auditId}.csv`),
                 "Results CSV downloaded."
@@ -945,7 +1010,7 @@ function ReviewReportsSection({ auditId, audit, reviews, quality, reviewer, anal
             onSubmit={(e) => {
               e.preventDefault();
               act(
-                () => postJSON(`plan-audits/${auditId}/review/`, { comments: reviewComment }),
+                () => postJSON(`plan-audits/${auditId}/review/`, { comments: reviewComment, ...reviewBinding }),
                 "Review comment submitted."
               );
             }}
@@ -960,9 +1025,10 @@ function ReviewReportsSection({ auditId, audit, reviews, quality, reviewer, anal
               <button disabled={!canAct}>Add review comment</button>
               <button
                 type="button"
-                disabled={!canAct}
+                disabled={!canAct || audit.publication_status !== "pending"
+                  || currentUserContributed || contributorIdentityMissing}
                 onClick={() => act(
-                  () => postJSON(`plan-audits/${auditId}/approve/`, { comments: reviewComment }),
+                  () => postJSON(`plan-audits/${auditId}/approve/`, { comments: reviewComment, ...reviewBinding }),
                   "Audit approved."
                 )}
               >
@@ -971,15 +1037,26 @@ function ReviewReportsSection({ auditId, audit, reviews, quality, reviewer, anal
               <button
                 type="button"
                 className="secondary"
-                disabled={!canAct || !reviewComment.trim()}
+                disabled={!canAct || !reviewComment.trim() || !["pending", "published"].includes(audit.publication_status)}
                 onClick={() => act(
-                  () => postJSON(`plan-audits/${auditId}/reject/`, { comments: reviewComment }),
+                  () => postJSON(`plan-audits/${auditId}/reject/`, { comments: reviewComment, ...reviewBinding }),
                   "Audit rejected."
                 )}
               >
                 Reject audit
               </button>
             </div>
+            {isCreatorOrRunner && (
+              <p className="muted" role="note">
+                You cannot approve an audit that you created or ran. An independent reviewer must approve this version.
+              </p>
+            )}
+            {!isCreatorOrRunner && isArtifactBuilder && (
+              <p className="muted" role="note">You cannot approve report artifacts that you generated. An independent reviewer must approve this version.</p>
+            )}
+            {contributorIdentityMissing && (
+              <p className="muted" role="note">Approval is disabled because creator, run initiator, or report builder identity is unavailable.</p>
+            )}
             <p className="muted">
               Only Reviewers and Super Admins may approve or reject. Review records are permanent and append-only.
             </p>
@@ -1008,6 +1085,9 @@ function PlanSetupSection({
   previewBusy, setPreviewBusy,
   error, setError, setErrorDetails, setNotice, setBusy,
 }) {
+  const assignedUserIds = new Set(accessRows.map((row) => String(row.user_id)));
+  const assignableUsers = viewerUsers.filter((item) => !assignedUserIds.has(String(item.id)));
+  const roleLabels = { ANALYST: "Analyst", REVIEWER: "Reviewer", CLIENT: "Client", Viewer: "Legacy Viewer" };
   async function act(action, success) {
     setBusy(true); setError(""); setErrorDetails(null); setNotice("");
     try { await action(); setNotice(success); onRefresh(); }
@@ -1021,9 +1101,9 @@ function PlanSetupSection({
 
   async function previewSummary(event) {
     event.preventDefault();
-    const form = event.currentTarget;
-    const summaryFile = form.elements.summary.files?.[0];
-    const manifestFile = form.elements.manifest.files?.[0];
+    const form = event.currentTarget.form || event.currentTarget.closest("form");
+    const summaryFile = form?.elements?.summary?.files?.[0];
+    const manifestFile = form?.elements?.manifest?.files?.[0];
     setPreviewBusy(true); setPreviewError(""); setSummaryPreview(null);
     try {
       const currentPlan = plans.find((item) => String(item.id) === String(planId));
@@ -1130,7 +1210,8 @@ function PlanSetupSection({
                 return;
               }
               act(async () => {
-                await uploadPlanSummary(organizationId, planId, form.get("summary"), form.get("manifest"));
+                const imported = await uploadPlanSummary(organizationId, planId, form.get("summary"), form.get("manifest"));
+                if (imported?.id) setImportId(String(imported.id));
                 element.reset(); setSummaryPreview(null);
               }, "Approved aggregate summary imported.");
             }}
@@ -1237,7 +1318,7 @@ function PlanSetupSection({
                 const item = await postJSON("plan-audits/create/", {
                   organization_id: organizationId,
                   plan_id: planId,
-                  summary_import_id: importId,
+                  summary_import_id: form.get("summary_import_id") || importId,
                   audit_name: form.get("audit_name"),
                   reporting_period: form.get("reporting_period"),
                 });
@@ -1246,6 +1327,23 @@ function PlanSetupSection({
               }, "Plan audit created.");
             }}
           >
+            {imports.length > 1 && (
+              <label className="plan-audit-field">
+                Summary import
+                <select
+                  name="summary_import_id"
+                  value={importId}
+                  onChange={(e) => setImportId(e.target.value)}
+                  required
+                >
+                  {imports.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.source_file_name} ({item.source_period || "no period"}; {item.import_status})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <Field name="audit_name" label="Audit name" maxLength="200" required />
             <Field
               name="reporting_period"
@@ -1282,15 +1380,17 @@ function PlanSetupSection({
                 <label className="plan-audit-field">
                   Account
                   <select name="user_id" required defaultValue="">
-                    <option value="">Select an active Analyst or Client</option>
-                    {viewerUsers.map((item) => (
+                    <option value="">Select an active Analyst, Reviewer or Client</option>
+                    {assignableUsers.map((item) => (
                       <option key={item.id} value={item.id}>
-                        {item.display_name} ({item.username}, ID {item.id})
+                        {item.display_name} ({item.username}; {(item.roles || [])
+                          .filter((role) => roleLabels[role])
+                          .map((role) => roleLabels[role]).join(", ")}; ID {item.id})
                       </option>
                     ))}
                   </select>
                 </label>
-                <button disabled={busy || viewerUsers.length === 0}>Grant access</button>
+                <button disabled={busy || assignableUsers.length === 0}>Grant access</button>
               </form>
               {accessRows.length ? (
                 <ul className="plan-audit-access-list">
@@ -1528,18 +1628,24 @@ export default function PlanAudits({ user }) {
     if (!auditId) return undefined;
     let alive = true;
     const base = `plan-audits/${auditId}/`;
-    Promise.all([
-      getJSON(base),
-      getJSON(`${base}overview/`),
-      getJSON(`${base}quality/`),
-      getJSON(`${base}review/`),
-    ]).then(([detail, overview, qualityData, reviewRows]) => {
-      if (!alive) return;
-      setAudit(detail); setMetrics(overview.metrics);
-      setQuality(qualityData); setReviews(reviewRows);
-    }).catch((e) => alive && setError(e.message));
+    (async () => {
+      try {
+        const detail = await getJSON(base);
+        if (!alive) return;
+        setAudit(detail);
+        if (!detail.can_view_results && !analyst && !reviewer) {
+          setMetrics(null); setQuality(null); setReviews([]);
+          return;
+        }
+        const [overview, qualityData, reviewRows] = await Promise.all([
+          getJSON(`${base}overview/`), getJSON(`${base}quality/`), getJSON(`${base}review/`),
+        ]);
+        if (!alive) return;
+        setMetrics(overview.metrics); setQuality(qualityData); setReviews(reviewRows);
+      } catch (e) { if (alive) setError(e.message); }
+    })();
     return () => { alive = false; };
-  }, [auditId, refreshKey]);
+  }, [auditId, refreshKey, analyst, reviewer]);
 
   // Load viewer users (admin only)
   useEffect(() => {
@@ -1620,10 +1726,16 @@ export default function PlanAudits({ user }) {
                 type="button"
                 disabled={busy || audit.status === "running"}
                 onClick={async () => {
+                  if (audit.publication_status === "published" &&
+                      !window.confirm("Starting a new run immediately suspends the published results until the new version is independently approved. Continue?")) return;
+                  setAudit((current) => current ? { ...current, status: "running", calculation_status: "running",
+                    publication_status: "pending", can_view_results: false, can_download_report: false,
+                    can_download_csv: false, summary: {}, result_fingerprint: null } : current);
+                  setMetrics(null); setQuality(null); setReviews([]); refresh();
                   setBusy(true); setError(""); setErrorDetails(null); setNotice("");
                   try {
                     await postJSON(`plan-audits/${auditId}/run/`);
-                    setNotice("Audit run finished.");
+                    setNotice("Audit run finished. Generate its PDF and CSV, then request independent approval before client publication.");
                     refresh();
                   } catch (e) {
                     setError(e.message);
@@ -1721,6 +1833,8 @@ export default function PlanAudits({ user }) {
           quality={quality}
           reviewer={reviewer}
           analyst={analyst}
+          admin={admin}
+          user={user}
           busy={busy}
           onRefresh={refresh}
         />

@@ -32,7 +32,7 @@ ALLOWED_HOSTS = [host.strip() for host in
                  if host.strip()]
 
 INSTALLED_APPS = [
-    "django.contrib.admin",
+    "pricing.admin_config.MFAAdminConfig",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
@@ -88,13 +88,14 @@ AUTH_PASSWORD_VALIDATORS = [
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "pricing.jwt_auth.AccessTokenAuthentication",
-        "rest_framework.authentication.SessionAuthentication",
+        "pricing.jwt_auth.MFASessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": ["pricing.permissions.CanView"],
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
 }
 
 SESSION_COOKIE_AGE = 8 * 60 * 60          # 8 hours
+MFA_SESSION_AGE = SESSION_COOKIE_AGE
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = "Lax"
 CSRF_COOKIE_SAMESITE = "Lax"
@@ -110,6 +111,10 @@ SECURE_HSTS_SECONDS = 31_536_000 if not DEBUG and SECURE_SSL_REDIRECT else 0
 SECURE_HSTS_INCLUDE_SUBDOMAINS = False
 JWT_ACCESS_TOKEN_SECONDS = int(os.environ.get("JWT_ACCESS_TOKEN_SECONDS", "900"))
 TOTP_ENCRYPTION_KEY = os.environ.get("TOTP_ENCRYPTION_KEY", "")
+TOTP_PAST_WINDOW_STEPS = int(os.environ.get("TOTP_PAST_WINDOW_STEPS", "0"))
+TOTP_FUTURE_WINDOW_STEPS = int(os.environ.get("TOTP_FUTURE_WINDOW_STEPS", "0"))
+if TOTP_PAST_WINDOW_STEPS < 0 or TOTP_FUTURE_WINDOW_STEPS < 0:
+    raise ImproperlyConfigured("TOTP verification windows must be non-negative integers.")
 
 # Login attempts: this many failures per username + address in the window -> blocked.
 LOGIN_MAX_FAILURES = 5
