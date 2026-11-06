@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from decimal import Decimal, InvalidOperation
 from datetime import date, datetime, timezone
@@ -30,7 +31,8 @@ from datetime import date, datetime, timezone
 import polars as pl
 
 from .common import (Dose, billing_units, drugs_in_scope, hospital_dose, load_yaml,
-                     parse_hcpcs_dosage, paths, quarter_of)
+                     parse_hcpcs_dosage, paths, quarter_of, sha256)
+from .artifacts import MART_ARTIFACTS, NORMALIZED_ARTIFACTS
 
 PRICE_TYPES = [
     # (column in hpt_drug_rates, price_type label, per payer?)
@@ -96,7 +98,7 @@ def main() -> int:
     benchmark_rule = cfg.get("benchmark_quarter", "file_date")
     bench = {(r["hcpcs"], r["quarter"]): r for r in asp.iter_rows(named=True)}
 
-    rates = pl.read_parquet(p["hpt_norm"] / "hpt_drug_rates.parquet")
+    rates = pl.read_parquet(p["hpt_norm"] / NORMALIZED_ARTIFACTS["hospital_rates"])
     out: list[dict] = []
     seen_hosp_level: set = set()
 
@@ -217,7 +219,13 @@ def main() -> int:
     df = pl.DataFrame(out, infer_schema_length=None)
     if len(df):
         df = unique_labels(df)
-    df.write_parquet(p["mart"] / "comparison.parquet", compression="zstd")
+    comparison_path = p["mart"] / MART_ARTIFACTS["comparison"]
+    comparison_tmp = comparison_path.with_name(comparison_path.name + ".part")
+    try:
+        df.write_parquet(comparison_tmp, compression="zstd")
+        os.replace(comparison_tmp, comparison_path)
+    finally:
+        comparison_tmp.unlink(missing_ok=True)
     info = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "asp_quarters": quarters,
@@ -231,9 +239,16 @@ def main() -> int:
         "drug_selection_source_file": next(iter(drugs.values())).get("selection_source_file") if drugs else None,
         "drug_selection_source_sha256": next(iter(drugs.values())).get("selection_source_sha256") if drugs else None,
         "rows": len(df),
+        "comparison_sha256": sha256(comparison_path),
         "source_files": sorted(rates["source_file"].unique().to_list()) if len(rates) else [],
     }
-    (p["mart"] / "run_info.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    info_path = p["mart"] / MART_ARTIFACTS["run_info"]
+    info_tmp = info_path.with_name(info_path.name + ".part")
+    try:
+        info_tmp.write_text(json.dumps(info, indent=2), encoding="utf-8")
+        os.replace(info_tmp, info_path)
+    finally:
+        info_tmp.unlink(missing_ok=True)
     if len(df):
         for row in df.group_by("status").len().sort("len", descending=True).to_dicts():
             print(f"  {row['status']}: {row['len']:,}")

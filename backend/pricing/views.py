@@ -34,8 +34,10 @@ from django.db import connections
 from . import data
 from .models import AuditEvent, DrugUnitReview, ProcessingJob, ReportRecord, SourceFile
 from .permissions import (ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP, SUPER_ADMIN_GROUP,
+                          CLIENT_GROUP, VIEWER_GROUP,
                           CanAdminister, CanAnalyze, CanReview, CanView, has_any_role)
 from pipeline.common import csv_safe_cell
+from pipeline.common import project_root
 
 HEADLINE = "price_type = 'negotiated_dollar' AND status = 'ok'"
 VIEWER_HEADLINE = "price_type = 'negotiated_dollar' AND status = 'ok' AND coalesce(reviewed, false)"
@@ -73,8 +75,12 @@ def _bounded_query_int(request, name: str, default: int, minimum: int, maximum: 
 
 def _viewer_release_payload(request):
     """Return only the current immutable report payload to a Viewer."""
-    if has_any_role(request.user, {ADMIN_GROUP}):
+    # Staff must be able to inspect drafts and source data before publication.
+    # Only client-facing accounts are constrained to the latest released snapshot.
+    if has_any_role(request.user, {ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP}):
         return None, None
+    if not has_any_role(request.user, {CLIENT_GROUP, VIEWER_GROUP}):
+        return None, Response({"error": "This account cannot access market reports."}, status=403)
     try:
         source_hash = data.comparison_sha256()
     except data.DataMissing as exc:
@@ -84,7 +90,7 @@ def _viewer_release_payload(request):
               .order_by("-generated_at").first())
     if report is None:
         return None, Response({"error": "No current report has been released for Viewer access."}, status=403)
-    path = settings.BASE_DIR.parent / "reports" / "dashboard_data.json"
+    path = project_root() / "reports" / "dashboard_data.json"
     try:
         raw = path.read_bytes()
         payload = json.loads(raw)
@@ -621,7 +627,7 @@ REFERENCE_TABLES = {
 
 
 @api_view(["GET"])
-@permission_classes([CanAdminister])
+@permission_classes([CanAnalyze])
 def reference_catalog(request):
     """Describe real Parquet reference tables and their loaded coverage."""
     import pyarrow.parquet as parquet
@@ -670,7 +676,7 @@ def reference_catalog(request):
 
 
 @api_view(["GET"])
-@permission_classes([CanAdminister])
+@permission_classes([CanAnalyze])
 def reference_table(request, dataset_name: str):
     """Search and page through an allow-listed analytical Parquet table."""
     import duckdb
@@ -1385,7 +1391,7 @@ def rates_xlsx(request):
 
 
 @api_view(["GET"])
-@permission_classes([CanAdminister])
+@permission_classes([CanAnalyze])
 def quality(request):
     try:
         rows = data.query("SELECT * FROM {quality} ORDER BY system, source_file", quality="quality")

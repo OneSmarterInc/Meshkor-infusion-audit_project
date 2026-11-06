@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -18,23 +19,18 @@ from django.utils import timezone
 
 from pricing import data as analytics_data
 from pricing.models import AuditEvent, ProcessingJob, ReportRecord, SourceFile
+from pipeline.artifacts import REFERENCE_ARTIFACTS, NORMALIZED_ARTIFACTS, MART_ARTIFACTS
+from pipeline.snapshots import create_stage, pipeline_mutex, publish_stage, recover_snapshot
 
 
 def _mark_parquet_converted(project: Path) -> int:
     """Mark uploads converted only when their checksum appears in a Parquet artifact."""
     import polars as pl
 
-    artifacts = [
-        project / "data" / "ref" / name for name in (
-            "ref_asp.parquet", "ref_crosswalk.parquet", "ref_ndc_products.parquet",
-            "ref_ndc_packages.parquet", "ref_nadac.parquet", "ref_providers.parquet",
-            "ref_enrollments.parquet", "ref_hospitals.parquet", "drug_scope.parquet",
-        )
-    ] + [
-        project / "data" / "hpt" / "norm" / name for name in (
-            "hpt_drug_rates.parquet", "hpt_file_quality.parquet",
-        )
-    ] + [project / "data" / "mart" / "comparison.parquet"]
+    artifacts = [project / "data" / "ref" / name for name in REFERENCE_ARTIFACTS.values()]
+    artifacts += [project / "data" / "hpt" / "norm" / name
+                  for name in NORMALIZED_ARTIFACTS.values()]
+    artifacts += [project / "data" / "mart" / MART_ARTIFACTS["comparison"]]
 
     hashes: set[str] = set()
     failed_hashes: set[str] = set()
@@ -74,10 +70,15 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         once, delay = options["once"], max(0.25, options["poll_interval"])
+        project = Path(__file__).resolve().parents[4]
         while True:
-            job = self._claim()
+            with pipeline_mutex(project):
+                recover_snapshot(project)
+                self._recover_abandoned_jobs()
+                job = self._claim()
+                if job:
+                    self._process(job)
             if job:
-                self._process(job)
                 if once:
                     return
             elif once:
@@ -85,6 +86,16 @@ class Command(BaseCommand):
                 return
             else:
                 time.sleep(delay)
+
+    def _recover_abandoned_jobs(self):
+        """Requeue jobs left running after a worker exited or the host restarted."""
+        abandoned = ProcessingJob.objects.filter(status="running")
+        for job in abandoned:
+            job.status = "queued"
+            job.progress = 0
+            job.started_at = None
+            job.error = "Previous worker stopped before completing this job; queued for retry."
+            job.save(update_fields=["status", "progress", "started_at", "error"])
 
     def _claim(self):
         with transaction.atomic():
@@ -98,10 +109,14 @@ class Command(BaseCommand):
             job.save(update_fields=["status", "progress", "started_at"])
             return job
 
-    def _run(self, job, args, progress, tail):
+    def _run(self, job, args, progress, tail, *, output_root=None):
         project = Path(__file__).resolve().parents[4]
+        child_env = os.environ.copy()
+        if output_root is not None:
+            child_env["IA_OUTPUT_ROOT"] = str(output_root)
         process = subprocess.Popen(
             [sys.executable, "-u", *args], cwd=project,
+            env=child_env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace", bufsize=1,
         )
@@ -119,21 +134,29 @@ class Command(BaseCommand):
         project = Path(__file__).resolve().parents[4]
         tail = []
         success = True
+        stage_root = None
         try:
+            stage_root = create_stage(project)
             if job.job_type == "refresh_data":
-                code = self._run(job, ["-m", "pipeline.run_all"], 10, tail)
+                code = self._run(job, ["-m", "pipeline.run_all"], 10, tail,
+                                 output_root=stage_root)
                 if code:
                     success = False
                 job.progress = 90
                 job.save(update_fields=["progress"])
-                report_code = self._run(job, ["build_market_report.py"], 90, tail)
+                report_code = self._run(job, ["build_market_report.py"], 90, tail,
+                                        output_root=stage_root)
                 success = success and report_code == 0
             elif job.job_type == "market_report":
-                code = self._run(job, ["build_market_report.py"], 15, tail)
+                code = self._run(job, ["build_market_report.py"], 15, tail,
+                                 output_root=stage_root)
                 success = code == 0
             else:
                 raise ValueError(f"Unsupported queued job type: {job.job_type}")
 
+            if success:
+                publish_stage(project, stage_root)
+                stage_root = None
             dashboard = project / "reports" / "dashboard_data.json"
             if dashboard.is_file():
                 dashboard_bytes = dashboard.read_bytes()
@@ -172,6 +195,10 @@ class Command(BaseCommand):
             success = False
             job.status = "failed"
             job.error = f"{type(exc).__name__}: {exc}\n" + "\n".join(tail[-100:])[-12000:]
+        finally:
+            if stage_root is not None and stage_root.exists():
+                import shutil
+                shutil.rmtree(stage_root, ignore_errors=True)
         job.finished_at = timezone.now()
         job.summary = {**(job.summary or {}), "output_tail": "\n".join(tail[-60:])[-8000:]}
         job.save(update_fields=["status", "progress", "error", "summary", "finished_at"])

@@ -59,7 +59,8 @@ def test_claims_extractor_suppresses_small_and_complementary_cells(tmp_path):
         billing_units=billing_units,
     )
     assert small_cell == []
-    assert small_quality["reasons"]["small_cell_suppressed"] == 1
+    assert small_quality["aggregate_cell_reasons"]["small_cell_suppressed"] == 1
+    assert small_quality["suppressed_aggregate_cells"] == 1
 
     rows, quality = aggregate_claims(
         _claims_for_site("1000000004", 10)
@@ -70,8 +71,9 @@ def test_claims_extractor_suppresses_small_and_complementary_cells(tmp_path):
     )
     assert len(rows) == 1
     assert rows[0]["site_npi"] == "1000000020"
-    assert quality["reasons"]["small_cell_suppressed"] == 1
-    assert quality["reasons"]["complementary_suppressed"] == 1
+    assert quality["aggregate_cell_reasons"]["small_cell_suppressed"] == 1
+    assert quality["aggregate_cell_reasons"]["complementary_suppressed"] == 1
+    assert quality["suppressed_aggregate_cells"] == 2
     assert "member_id" not in rows[0]
     assert "_member_count_for_local_suppression" not in rows[0]
 
@@ -97,7 +99,8 @@ def test_claims_aggregate_precision_is_exact_or_explicitly_excluded():
         billing_units={"J9271": {"qty": Decimal("1"), "unit": "UNIT"}},
     )
     assert rows == []
-    assert quality["reasons"]["aggregate_exceeds_import_precision"] == 1
+    assert quality["aggregate_cell_reasons"]["aggregate_exceeds_import_precision"] == 1
+    assert quality["rejected_aggregate_cells"] == 1
 
 
 def test_file_date_quarter_does_not_fall_back_to_latest_asp():

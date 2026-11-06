@@ -89,6 +89,31 @@ class AdminOTPDevice(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
 
+class AuthThrottleBucket(models.Model):
+    """Database-backed authentication failure bucket shared by all workers."""
+    key = models.CharField(max_length=64, unique=True)
+    failure_count = models.PositiveSmallIntegerField(default=0)
+    window_started_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["updated_at"], name="auth_throttle_updated_ix")]
+
+
+class AuthChallenge(models.Model):
+    PURPOSES = [("login", "Login"), ("enroll", "Authenticator enrollment")]
+    token_sha256 = models.CharField(max_length=64, unique=True)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+                             related_name="auth_challenges")
+    purpose = models.CharField(max_length=16, choices=PURPOSES)
+    expires_at = models.DateTimeField(db_index=True)
+    consumed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["user", "purpose", "expires_at"], name="auth_challenge_user_ix")]
+
+
 class AuditEvent(models.Model):
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
                               on_delete=models.SET_NULL, related_name="audit_events")

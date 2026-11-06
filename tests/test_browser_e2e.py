@@ -17,6 +17,11 @@ import pytest
 import yaml
 from cryptography.fernet import Fernet
 
+pytest.importorskip(
+    "playwright.sync_api",
+    reason="Install the optional Playwright package to run browser end-to-end checks.",
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
 
@@ -249,7 +254,10 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
                     raise
                 time.sleep(0.1 * (attempt + 1))
 
-    from playwright.sync_api import sync_playwright
+    sync_playwright = pytest.importorskip(
+        "playwright.sync_api",
+        reason="Install the optional Playwright package to run browser end-to-end checks.",
+    ).sync_playwright
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(
         headless=not request.config.getoption("--headed"),

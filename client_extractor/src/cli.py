@@ -3,8 +3,10 @@ import csv
 import json
 import hashlib
 import math
+import os
 import re
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -106,6 +108,8 @@ def extract_claims(args):
         logger.error("Claims input could not be inspected: %s", exc)
         return 2
 
+    _archive_previous_export(args.output)
+
     claims, errors, fingerprints = [], [], set()
     input_count = duplicate_count = invalid_count = 0
     try:
@@ -152,7 +156,11 @@ def extract_claims(args):
     )
     for reason, count in privacy_quality["reasons"].items():
         quality["reasons"][reason] = quality["reasons"].get(reason, 0) + count
-        quality["excluded_records"] += count
+    quality["excluded_records"] += privacy_quality["excluded_records"]
+    quality["suppressed_aggregate_cells"] = privacy_quality["suppressed_aggregate_cells"]
+    quality["rejected_aggregate_cells"] = privacy_quality["rejected_aggregate_cells"]
+    quality["excluded_aggregate_cells"] = privacy_quality["excluded_aggregate_cells"]
+    quality["aggregate_cell_reasons"] = privacy_quality["aggregate_cell_reasons"]
     quality["exported_aggregate_rows"] = len(summary)
     quality["schema_version"] = SCHEMA_VERSION
     _write_quality(args.output, quality, errors)
@@ -179,6 +187,20 @@ def extract_claims(args):
 def _record_fingerprint(claim):
     fields = sorted(REQUIRED_FIELDS | {"adjustment_reference", "reversal_reference", "service_setting"})
     return tuple(str(claim.get(field, "")) for field in fields)
+
+
+def _archive_previous_export(output):
+    """Keep prior approved exports, but never leave one looking current after a new run starts."""
+    output = Path(output)
+    export_names = ("claims_summary.csv", "manifest.json")
+    existing = [output / name for name in export_names if (output / name).exists()]
+    if not existing:
+        return
+    archive = output / "history" / f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
+    archive.mkdir(parents=True, exist_ok=False)
+    for path in existing:
+        os.replace(path, archive / path.name)
+    logger.info("Previous approved export archived at %s", archive)
 
 
 def _map_source_columns(row, column_mapping):

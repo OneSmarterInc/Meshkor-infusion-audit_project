@@ -29,6 +29,7 @@ import polars as pl
 
 from .common import (drugs_in_scope, load_yaml, norm_hcpcs, norm_ndc, paths, payer_group,
                      rel, sha256, to_float)
+from .artifacts import NORMALIZED_ARTIFACTS, REFERENCE_ARTIFACTS
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
@@ -42,7 +43,7 @@ class Scope:
     def __init__(self, ref_dir: Path):
         self.hcpcs = {d["hcpcs"] for d in drugs_in_scope()}
         self.ndc_to_hcpcs: dict[str, str] = {}
-        xw = ref_dir / "ref_crosswalk.parquet"
+        xw = ref_dir / REFERENCE_ARTIFACTS["crosswalk"]
         if xw.exists():
             df = (pl.read_parquet(xw, columns=["hcpcs", "ndc11"])
                   .filter(pl.col("hcpcs").is_in(list(self.hcpcs))).unique())
@@ -870,8 +871,8 @@ def main() -> int:
         print("NOTE: no crosswalk loaded; NDC-only rows cannot be matched. "
               "Run python -m pipeline.load_asp first.")
     source_root = p["raw"] / "hospital_mrf"
-    rates_final = p["hpt_norm"] / "hpt_drug_rates.parquet"
-    quality_final = p["hpt_norm"] / "hpt_file_quality.parquet"
+    rates_final = p["hpt_norm"] / NORMALIZED_ARTIFACTS["hospital_rates"]
+    quality_final = p["hpt_norm"] / NORMALIZED_ARTIFACTS["hospital_quality"]
     known_sources = _known_quality_sources(quality_final)
     archives = normalized_parquet_archives(p["ref"])
     primary_archive = max(archives, key=lambda path: path.stat().st_mtime_ns) if archives else None

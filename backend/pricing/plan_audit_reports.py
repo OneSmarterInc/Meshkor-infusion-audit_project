@@ -45,6 +45,21 @@ def _savings_payload(item):
     }
 
 
+def _paged_response(request, queryset, serialize, *, default_limit=200, max_limit=500):
+    try:
+        limit = min(max(int(request.query_params.get("limit", default_limit)), 1), max_limit)
+        offset = max(int(request.query_params.get("offset", 0)), 0)
+    except (TypeError, ValueError):
+        return Response({"error": "limit and offset must be whole numbers."}, status=400)
+    total = queryset.count()
+    page_rows = list(queryset[offset:offset + limit])
+    next_offset = offset + len(page_rows) if offset + len(page_rows) < total else None
+    return Response({"count": total, "limit": limit, "offset": offset,
+                     "next_offset": next_offset,
+                     "previous_offset": max(0, offset - limit) if offset else None,
+                     "results": [serialize(row) for row in page_rows]})
+
+
 @api_view(["GET"])
 @permission_classes([CanView])
 def audit_savings(request, audit_id):
@@ -52,7 +67,7 @@ def audit_savings(request, audit_id):
     rows = run_opportunities(current_audit_run(audit))
     if is_client_only(request.user):
         rows = rows.filter(validation_status="validated", clinical_review_status__in=("approved", "validated"))
-    return Response([_savings_payload(item) for item in rows[:2000]])
+    return _paged_response(request, rows.order_by("pk"), _savings_payload)
 
 
 @api_view(["GET"])
@@ -60,12 +75,14 @@ def audit_savings(request, audit_id):
 def audit_network_validation(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
     rows = run_results(current_audit_run(audit)).order_by("site_npi", "quarter", "hcpcs_code")
-    return Response([{
+    def serialize(row):
+        return {
         "site_npi": row.site_npi, "quarter": row.quarter,
         "data_network_status": row.network_status,
         "hcpcs_code": row.hcpcs_code, "service_setting": row.service_setting,
         "source_references": row.source_references,
-    } for row in rows[:2000]])
+    }
+    return _paged_response(request, rows, serialize)
 
 
 @api_view(["GET"])
@@ -166,7 +183,9 @@ def _build_pdf(audit, run):
     draw(f"Visible units: {metrics['units_analyzed']} | Allowed: {metrics['visible_allowed_amount']} | Paid: {metrics['visible_paid_amount']}")
     draw("Potential savings are shown only when validated and clinically approved.")
     draw("HCPCS | NPI | Quarter | Allowed/unit | Paid/unit | Hospital/unit | ASP | Quality", bold=True)
-    for row in run_results(run)[:5000]:
+    total_rows = run_results(run).count()
+    draw(f"Summary detail: first 5,000 of {total_rows:,} result rows; complete detail is in the companion CSV.")
+    for row in run_results(run).order_by("pk")[:5000]:
         draw(f"{row.hcpcs_code} | {row.site_npi} | {row.quarter} | {_decimal_text(row.plan_allowed_price_per_unit)} | "
              f"{_decimal_text(row.plan_paid_price_per_unit)} | {_decimal_text(row.hospital_price_per_unit)} | "
              f"{_decimal_text(row.asp_payment_limit)} | {row.data_quality_status}")

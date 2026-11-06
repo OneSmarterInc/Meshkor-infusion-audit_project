@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 from collections import Counter, defaultdict
 from datetime import date
 from pathlib import Path
@@ -15,10 +16,19 @@ from statistics import median
 import pyarrow.parquet as pq
 import polars as pl
 from pipeline.common import csv_safe_cell
+from pipeline.artifacts import REFERENCE_ARTIFACTS
 
 
 ROOT = Path(__file__).resolve().parent
 REPORT_CONFIG = ROOT / "config/report.json"
+
+
+def data_root() -> Path:
+    return Path(os.environ.get("IA_DATA_ROOT") or ROOT).resolve()
+
+
+def artifact_root() -> Path:
+    return Path(os.environ.get("IA_OUTPUT_ROOT") or data_root()).resolve()
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -72,11 +82,15 @@ def write_csv(path: Path, columns: list[str], rows: list[dict]) -> None:
 
 
 def stored_scope_status(run: dict, comparison_rows: list[dict],
-                        config: dict, comparison_path: Path) -> tuple[bool, str]:
+                        config: dict, comparison_path: Path,
+                        root: Path | None = None,
+                        snapshot_root: Path | None = None) -> tuple[bool, str]:
     """Verify the saved Parquet scope; raw CMS files are optional after import."""
     selected_source = run.get("drug_selection_source_file")
     selected_hash = run.get("drug_selection_source_sha256")
-    scope_path = ROOT / "data" / "ref" / "drug_scope.parquet"
+    root = root or data_root()
+    snapshot_root = snapshot_root or artifact_root()
+    scope_path = snapshot_root / "data" / "ref" / "drug_scope.parquet"
     if (run.get("drug_selection_source") != config["selection_source"]
             or not selected_source or not selected_hash or not scope_path.is_file()
             or not comparison_path.is_file()):
@@ -98,9 +112,9 @@ def stored_scope_status(run: dict, comparison_rows: list[dict],
                 or (run.get("rows") is not None and len(comparison_rows) != run["rows"])):
             return False, "inconsistent_parquet"
 
-        source_path = ROOT / selected_source
+        source_path = root / selected_source
         if not source_path.is_file() and selected_source.startswith("data/raw/"):
-            source_path = ROOT / "data" / "raw_essential_inputs" / selected_source[len("data/raw/"):]
+            source_path = root / "data" / "raw_essential_inputs" / selected_source[len("data/raw/"):]
         if source_path.is_file():
             from pipeline.common import sha256
             if sha256(source_path) != selected_hash:
@@ -111,13 +125,14 @@ def stored_scope_status(run: dict, comparison_rows: list[dict],
         return False, "invalid_parquet"
 
 
-def input_inventory(config: dict) -> list[dict]:
+def input_inventory(config: dict, root: Path | None = None) -> list[dict]:
+    root = root or data_root()
     inventory = []
     for group in ("required_inputs", "supplemental_inputs"):
         for spec in config.get(group, []):
             matches = set()
             for pattern in spec.get("patterns", []):
-                matches.update(p for p in ROOT.glob(pattern) if p.is_file()
+                matches.update(p for p in root.glob(pattern) if p.is_file()
                                and not p.name.endswith((".part", ".sha256")))
             inventory.append({
                 "key": spec["key"],
@@ -206,9 +221,9 @@ def parquet_lineage_status(paths: dict[str, Path]) -> tuple[bool, list[str]]:
     return not problems, problems
 
 
-def reference_coverage() -> dict:
+def reference_coverage(root: Path | None = None) -> dict:
     """Summarize only locally loaded reference Parquet; never synthesize counts."""
-    ref_dir = ROOT / "data" / "ref"
+    ref_dir = (root or data_root()) / "data" / "ref"
     sources = [
         ("asp", "CMS ASP benchmarks", ref_dir / "ref_asp.parquet"),
         ("crosswalk", "CMS NDC–HCPCS crosswalk", ref_dir / "ref_crosswalk.parquet"),
@@ -245,22 +260,23 @@ def reference_coverage() -> dict:
     return {"datasets": rows, "asp_quarters": quarter_rows}
 
 
-def loaded_reference_sources() -> list[dict]:
+def loaded_reference_sources(root: Path | None = None) -> list[dict]:
     """Use lineage embedded by the loaders to make source exports useful in draft runs."""
+    root = (root or data_root()).resolve()
     specs = [
-        ("cms_asp", "data/ref/ref_asp.parquet"),
-        ("cms_crosswalk", "data/ref/ref_crosswalk.parquet"),
-        ("fda_ndc_products", "data/ref/ref_ndc_products.parquet"),
-        ("fda_ndc_packages", "data/ref/ref_ndc_packages.parquet"),
-        ("nadac", "data/ref/ref_nadac.parquet"),
-        ("cms_hospital_list", "data/ref/ref_hospitals.parquet"),
-        ("cms_partb_spending", "data/ref/drug_scope.parquet"),
-        ("nppes", "data/ref/ref_providers.parquet"),
-        ("hospital_enrollments", "data/ref/ref_enrollments.parquet"),
+        ("cms_asp", REFERENCE_ARTIFACTS["asp"]),
+        ("cms_crosswalk", REFERENCE_ARTIFACTS["crosswalk"]),
+        ("fda_ndc_products", REFERENCE_ARTIFACTS["ndc_products"]),
+        ("fda_ndc_packages", REFERENCE_ARTIFACTS["ndc_packages"]),
+        ("nadac", REFERENCE_ARTIFACTS["nadac"]),
+        ("cms_hospital_list", REFERENCE_ARTIFACTS["hospitals"]),
+        ("cms_partb_spending", REFERENCE_ARTIFACTS["drug_scope"]),
+        ("nppes", REFERENCE_ARTIFACTS["providers"]),
+        ("hospital_enrollments", REFERENCE_ARTIFACTS["enrollments"]),
     ]
     result = []
     for kind, relative_path in specs:
-        path = ROOT / relative_path
+        path = root / "data" / "ref" / relative_path
         if not path.is_file():
             continue
         columns = set(pq.ParquetFile(path).schema_arrow.names)
@@ -295,12 +311,16 @@ def loaded_reference_sources() -> list[dict]:
 
 
 def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
-                 run_info_path: Path, report_config_path: Path = REPORT_CONFIG) -> Path:
+                 run_info_path: Path, report_config_path: Path = REPORT_CONFIG,
+                 root: Path | None = None,
+                 snapshot_root: Path | None = None) -> Path:
+    root = (root or data_root()).resolve()
+    snapshot_root = (snapshot_root or artifact_root()).resolve()
     rows = read_rows(comparison_path)
     quality = read_rows(quality_path)
     run = json.loads(run_info_path.read_text(encoding="utf-8"))
     config = json.loads(report_config_path.read_text(encoding="utf-8"))
-    inventory = input_inventory(config)
+    inventory = input_inventory(config, root)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     selection_input_present = bool(next((i["files"] for i in inventory
@@ -308,9 +328,9 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
     original_sources_verified, source_integrity_problems = required_source_integrity(inventory)
     selected_hash = run.get("drug_selection_source_sha256")
     scope_current, scope_snapshot_status = stored_scope_status(
-        run, rows, config, comparison_path)
+        run, rows, config, comparison_path, root, snapshot_root)
     scope_lookup: dict[str, dict] = {}
-    scope_path = ROOT / "data" / "ref" / "drug_scope.parquet"
+    scope_path = snapshot_root / "data" / "ref" / "drug_scope.parquet"
     if scope_path.is_file():
         available = set(pq.ParquetFile(scope_path).schema_arrow.names)
         wanted = [name for name in ("hcpcs", "partb_spending", "reviewed_by", "review_date",
@@ -336,9 +356,9 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
         "comparison": comparison_path,
         "quality": quality_path,
         "run_info": run_info_path,
-        "asp": ROOT / "data" / "ref" / "ref_asp.parquet",
-        "scope": ROOT / "data" / "ref" / "drug_scope.parquet",
-        "hospital_rates": ROOT / "data" / "hpt" / "norm" / "hpt_drug_rates.parquet",
+        "asp": snapshot_root / "data" / "ref" / "ref_asp.parquet",
+        "scope": snapshot_root / "data" / "ref" / "drug_scope.parquet",
+        "hospital_rates": snapshot_root / "data" / "hpt" / "norm" / "hpt_drug_rates.parquet",
     }
     required_parquets_ready = all(path.is_file() for path in required_parquets.values())
     parquet_lineage_verified, parquet_lineage_problems = parquet_lineage_status(required_parquets)
@@ -452,7 +472,7 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
             file_date = file_date.isoformat()
         if file_date and str(file_date) > entry["latest_file_last_updated"]:
             entry["latest_file_last_updated"] = str(file_date)
-    source_rows = loaded_reference_sources()
+    source_rows = loaded_reference_sources(snapshot_root)
     for entry in source_map.values():
         entry["hcpcs_codes"] = ",".join(sorted(entry["hcpcs_codes"]))
         entry.setdefault("reference_rows", 0)
@@ -556,7 +576,7 @@ def build_report(output_dir: Path, comparison_path: Path, quality_path: Path,
         "hospital_rates": site_rows,
         "source_inventory": source_rows,
         "inputs": input_summary,
-        "reference_coverage": reference_coverage(),
+        "reference_coverage": reference_coverage(snapshot_root),
         "method_notes": config.get("method_notes", []),
         "status_notes": status_notes,
         "headline_price_type": config["headline_price_type"],
@@ -652,13 +672,16 @@ Rows outside the configured headline status are excluded from headline medians.
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "reports")
-    parser.add_argument("--comparison", type=Path, default=ROOT / "data/mart/comparison.parquet")
-    parser.add_argument("--quality", type=Path, default=ROOT / "data/hpt/norm/hpt_file_quality.parquet")
-    parser.add_argument("--run-info", type=Path, default=ROOT / "data/mart/run_info.json")
+    root = data_root()
+    snapshot = artifact_root()
+    parser.add_argument("--output-dir", type=Path, default=snapshot / "reports")
+    parser.add_argument("--comparison", type=Path, default=snapshot / "data/mart/comparison.parquet")
+    parser.add_argument("--quality", type=Path, default=snapshot / "data/hpt/norm/hpt_file_quality.parquet")
+    parser.add_argument("--run-info", type=Path, default=snapshot / "data/mart/run_info.json")
     parser.add_argument("--report-config", type=Path, default=REPORT_CONFIG)
     args = parser.parse_args()
-    output = build_report(args.output_dir, args.comparison, args.quality, args.run_info, args.report_config)
+    output = build_report(args.output_dir, args.comparison, args.quality, args.run_info,
+                          args.report_config, root=root, snapshot_root=snapshot)
     print(f"Wrote {output}")
     outputs = json.loads(args.report_config.read_text(encoding="utf-8"))["output_files"]
     print(f"Wrote {args.output_dir / outputs['sites']}")

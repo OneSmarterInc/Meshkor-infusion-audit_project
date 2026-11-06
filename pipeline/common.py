@@ -36,8 +36,20 @@ def load_yaml(name: str) -> dict:
 def paths() -> dict[str, Path]:
     """Data folders. IA_DATA_ROOT overrides the base folder (used by tests)."""
     cfg = load_yaml("pipeline.yaml")["paths"]
-    base = Path(os.environ.get("IA_DATA_ROOT", PROJECT))
-    return {k: base / v for k, v in cfg.items()}
+    base = project_root()
+    output_root = os.environ.get("IA_OUTPUT_ROOT", "").strip()
+    if not output_root:
+        return {k: base / v for k, v in cfg.items()}
+    stage = Path(output_root).resolve()
+    return {k: (base / v if k == "raw" else stage / v) for k, v in cfg.items()}
+
+
+def project_root() -> Path:
+    configured = os.environ.get("IA_DATA_ROOT", "").strip()
+    root = Path(configured).resolve() if configured else PROJECT
+    from .snapshots import ensure_snapshot_consistent
+    ensure_snapshot_consistent(root)
+    return root
 
 
 def drugs_in_scope() -> list[dict]:
@@ -80,9 +92,9 @@ def write_sha256_sidecar(path: Path, digest: str | None = None) -> str:
 def rel(path: Path) -> str:
     """Path relative to the project, with forward slashes (stable across OS)."""
     try:
-        return path.resolve().relative_to(PROJECT).as_posix()
+        return path.resolve().relative_to(project_root()).as_posix()
     except ValueError:
-        return path.as_posix()
+        return path.resolve().as_posix()
 
 
 # ---------- quarters ----------
