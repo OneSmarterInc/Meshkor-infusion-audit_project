@@ -2,6 +2,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +15,15 @@ APPROVED_FIELDS = [
 ]
 
 
-def export_summary(rows, output_directory):
+def export_summary(rows, output_directory, *, source_provenance):
+    if (not isinstance(source_provenance, dict)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(source_provenance.get("source_sha256", "")))
+            or source_provenance.get("source_format") not in {"csv", "xlsx", "xlsm"}
+            or not isinstance(source_provenance.get("input_records"), int)
+            or source_provenance["input_records"] < 1
+            or not str(source_provenance.get("source_period", ""))
+            or not str(source_provenance.get("plan_reference", ""))):
+        raise ValueError("Source provenance is incomplete or invalid.")
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
     destination = output / "claims_summary.csv"
@@ -38,6 +47,8 @@ def export_summary(rows, output_directory):
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "raw_claims_included": False, "member_identifiers_included": False,
         "small_cell_suppression_threshold": 11,
+        "complementary_suppression_applied": True,
+        "source_provenance": source_provenance,
     }
     manifest_path = output / "manifest.json"
     manifest_tmp = manifest_path.with_suffix(".json.part")

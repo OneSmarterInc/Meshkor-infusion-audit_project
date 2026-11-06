@@ -1,0 +1,3 @@
+provider_npi,provider_name,network_name,network_status,effective_start,effective_end,service_location,applicable_plan_reference
+1000000004,Synthetic Site A,Synthetic Choice,in_network,2026-01-01,2026-12-31,Synthetic Location A,RG01-248CCDAF
+1000000012,Synthetic Site B,Synthetic Choice,in_network,2026-01-01,2026-12-31,Synthetic Location B,RG01-248CCDAF

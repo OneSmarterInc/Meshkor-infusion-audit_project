@@ -1,0 +1,2 @@
+plan_reference,hcpcs_code,site_npi,quarter,service_setting,total_units,total_allowed_amount,total_paid_amount,member_count_band,source_period,extraction_timestamp,schema_version
+RG01-91DC7104,J1745,1000000004,2026Q4,outpatient_hospital,11,990,770,11-50,2026-10-15/2026-10-15,2026-11-06T04:38:46+00:00,1.0

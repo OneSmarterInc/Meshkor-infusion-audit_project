@@ -1,0 +1,17 @@
+{
+  "summary": {
+    "total_input_records": 11,
+    "valid_records": 11,
+    "invalid_records": 0,
+    "duplicate_records": 0,
+    "adjusted_records": 0,
+    "reversed_records": 0,
+    "excluded_records": 0,
+    "reasons": {},
+    "exported_aggregate_rows": 1,
+    "schema_version": "1.0"
+  },
+  "row_errors": [],
+  "raw_claim_values_included": false,
+  "member_identifiers_included": false
+}

@@ -2,8 +2,8 @@
 import csv
 import hashlib
 import re
-from collections import defaultdict
-from datetime import date
+from collections import Counter, defaultdict
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
@@ -13,11 +13,11 @@ from . import data
 from .models import DrugUnitReview, NetworkRosterEntry, PlanAuditResult, SavingsOpportunity
 
 
-def run_plan_audit(audit):
+def run_plan_audit(audit, audit_run):
     summary_rows = list(audit.summary_import.records.all())
     codes = sorted({row.hcpcs_code for row in summary_rows})
     quarters = sorted({row.quarter for row in summary_rows})
-    notes_by_code, scope, approvals = _unit_approvals(codes)
+    notes_by_code, scope, approvals, unit_review_hashes = _unit_approvals(codes)
     asp, asp_errors = _asp_rows(codes, quarters)
     hpt, hospital_errors = _hospital_rows(codes, quarters)
     roster = list(NetworkRosterEntry.objects.filter(plan=audit.plan).order_by("provider_npi", "effective_start"))
@@ -74,11 +74,17 @@ def run_plan_audit(audit):
             "hospital_site_mapping_sha256": site_mapping_hash,
             "network_roster_source_sha256": _roster_source_hashes(roster, source.site_npi, source.quarter),
             "drug_selection_source_sha256": (scope.get(source.hcpcs_code) or {}).get("selection_source_sha256"),
-            "unit_review_source_sha256": (scope.get(source.hcpcs_code) or {}).get("unit_review_sha256") if unit_ok else None,
+            "unit_review_source_sha256": (unit_review_hashes.get(source.hcpcs_code)
+                                          or (scope.get(source.hcpcs_code) or {}).get("unit_review_sha256"))
+                                         if unit_ok else None,
             "unit_review_status": "validated" if unit_ok else "unresolved",
+            "unit_review_billing_qty": ((scope.get(source.hcpcs_code) or {}).get("billing_unit") or {}).get("qty")
+                                       if unit_ok else None,
+            "unit_review_billing_unit": ((scope.get(source.hcpcs_code) or {}).get("billing_unit") or {}).get("unit")
+                                        if unit_ok else None,
         }
         result = PlanAuditResult(
-            plan_audit=audit, summary_record=source,
+            plan_audit=audit, audit_run=audit_run, summary_record=source,
             hcpcs_code=source.hcpcs_code,
             drug_description=str(benchmark.get("short_description") or "")[:240] if benchmark else "",
             site_npi=source.site_npi,
@@ -97,7 +103,7 @@ def run_plan_audit(audit):
         result_by_key[key] = (source, result, unit_ok)
 
     PlanAuditResult.objects.bulk_create(results, batch_size=1000)
-    opportunities = _build_opportunities(audit, summary_rows, result_by_key, roster)
+    opportunities = _build_opportunities(audit, audit_run, summary_rows, result_by_key, roster)
     SavingsOpportunity.objects.bulk_create(opportunities, batch_size=1000)
     quality_counts = defaultdict(int)
     for result in results:
@@ -114,6 +120,7 @@ def run_plan_audit(audit):
 def _unit_approvals(codes):
     scope = {}
     approvals = set()
+    review_hashes = {}
     notes = defaultdict(list)
     try:
         current_scope = data.drug_config()
@@ -130,6 +137,7 @@ def _unit_approvals(codes):
                 if (unit and _decimal(unit.get("qty")) == review.billing_qty
                         and str(unit.get("unit", "")).upper() == review.billing_unit.upper()):
                     approvals.add(review.hcpcs)
+                    review_hashes[review.hcpcs] = review.scope_source_sha256
                 else:
                     notes[review.hcpcs].append("UNIT_UNRESOLVED")
     except (data.DataMissing, OSError, ValueError, KeyError):
@@ -138,7 +146,7 @@ def _unit_approvals(codes):
     for code in codes:
         if code not in approvals:
             notes[code].append("UNIT_UNRESOLVED")
-    return notes, scope, approvals
+    return notes, scope, approvals, review_hashes
 
 
 def _asp_rows(codes, quarters):
@@ -169,7 +177,7 @@ def _hospital_rows(codes, quarters):
             f"billing_units, status, price_type, source_file, source_sha256, effective_start, effective_end "
             f"FROM {{comparison}} WHERE hcpcs IN ({placeholders}) "
             f"AND benchmark_quarter IN ({q_placeholders}) "
-            f"AND price_type = 'negotiated_dollar' AND status IN ('ok','review_range') "
+            f"AND price_type = 'negotiated_dollar' AND status = 'ok' "
             f"AND price_per_billing_unit IS NOT NULL AND billing_units > 0",
             [*codes, *quarters], comparison="comparison",
         )
@@ -238,7 +246,7 @@ def _verified_site_names():
     return name_to_npi
 
 
-def _build_opportunities(audit, rows, result_by_key, roster):
+def _build_opportunities(audit, audit_run, rows, result_by_key, roster):
     by_group = defaultdict(list)
     for source in rows:
         key = (source.hcpcs_code, source.site_npi, source.quarter, source.service_setting)
@@ -279,7 +287,7 @@ def _build_opportunities(audit, rows, result_by_key, roster):
                 paid_difference = (current_result.plan_paid_price_per_unit -
                                    alternative_result.plan_paid_price_per_unit) * current.total_units
             opportunities.append(SavingsOpportunity(
-                plan_audit=audit, hcpcs_code=code, quarter=quarter, service_setting=setting,
+                plan_audit=audit, audit_run=audit_run, hcpcs_code=code, quarter=quarter, service_setting=setting,
                 current_site_npi=current.site_npi, alternative_site_npi=alternative.site_npi,
                 current_allowed_price_per_unit=current_price,
                 alternative_allowed_price_per_unit=alternative_result.plan_allowed_price_per_unit,
@@ -308,17 +316,78 @@ def network_status_for(roster, npi, quarter):
     records = [item for item in roster if item.provider_npi == npi]
     if not records:
         return "NETWORK_STATUS_UNKNOWN"
-    covering = [item for item in records if item.effective_start <= start
-                and (item.effective_end is None or item.effective_end >= end)]
-    statuses = {item.network_status for item in covering}
-    if statuses == {"in_network"}:
-        return "IN_NETWORK"
-    if statuses == {"out_of_network"}:
-        return "OUT_OF_NETWORK"
-    if statuses:
+
+    overlapping = []
+    expired = []
+    for item in records:
+        record_start, record_end = item.effective_start, item.effective_end
+        if record_start is None or (record_end is not None and record_end < record_start):
+            return "NETWORK_STATUS_UNKNOWN"
+        if record_end is not None and record_end < start:
+            expired.append(item)
+            continue
+        if record_start > end:
+            continue
+        if record_start <= end and (record_end is None or record_end >= start):
+            overlapping.append(item)
+    if not overlapping:
+        if expired and len(expired) == len(records):
+            return "NETWORK_DATA_EXPIRED"
         return "NETWORK_STATUS_UNKNOWN"
-    if any(item.effective_end is not None and item.effective_end < start for item in records):
-        return "NETWORK_DATA_EXPIRED"
+
+    # The audit supplies a plan and provider NPI, but no network-contract or
+    # service-location selector. Multiple such identities cannot be resolved safely.
+    identities = set()
+    plan_ids = set()
+    for item in overlapping:
+        network_name = str(item.network_name or "").strip().casefold()
+        service_location = str(item.service_location or "").strip().casefold()
+        source_hash = str(item.source_hash or "").lower()
+        if (not network_name or not service_location or len(source_hash) != 64
+                or any(char not in "0123456789abcdef" for char in source_hash)):
+            return "NETWORK_STATUS_UNKNOWN"
+        identities.add((network_name, service_location))
+        if item.plan_id is None:
+            return "NETWORK_STATUS_UNKNOWN"
+        plan_ids.add(item.plan_id)
+    if len(identities) != 1 or len(plan_ids) != 1:
+        return "NETWORK_STATUS_UNKNOWN"
+
+    quarter_end_exclusive = end + timedelta(days=1)
+    events = defaultdict(lambda: {"add": [], "remove": []})
+    for item in overlapping:
+        status = str(item.network_status or "").strip().casefold()
+        if status not in {"in_network", "out_of_network"}:
+            return "NETWORK_STATUS_UNKNOWN"
+        clipped_start = max(start, item.effective_start)
+        clipped_end = min(end, item.effective_end) if item.effective_end else end
+        events[clipped_start]["add"].append(status)
+        events[clipped_end + timedelta(days=1)]["remove"].append(status)
+
+    boundaries = sorted({start, quarter_end_exclusive, *events})
+    active = Counter()
+    consistent_status = None
+    for index, boundary in enumerate(boundaries[:-1]):
+        for status in events[boundary]["remove"]:
+            active[status] -= 1
+            if active[status] <= 0:
+                del active[status]
+        for status in events[boundary]["add"]:
+            active[status] += 1
+        if boundaries[index + 1] <= boundary:
+            continue
+        if not active or len(active) != 1:
+            return "NETWORK_STATUS_UNKNOWN"
+        status = next(iter(active))
+        if consistent_status is None:
+            consistent_status = status
+        elif status != consistent_status:
+            return "NETWORK_STATUS_UNKNOWN"
+
+    if consistent_status == "in_network":
+        return "IN_NETWORK"
+    if consistent_status == "out_of_network":
+        return "OUT_OF_NETWORK"
     return "NETWORK_STATUS_UNKNOWN"
 
 

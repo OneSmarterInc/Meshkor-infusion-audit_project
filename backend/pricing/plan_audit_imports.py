@@ -14,7 +14,10 @@ from rest_framework.response import Response
 
 from pipeline.common import HCPCS_RE
 from .models import AuditEvent, ClaimsSummaryImport, ClaimsSummaryRecord
-from .permissions import CanView, CanAnalyze, has_any_role, SUPER_ADMIN_GROUP, ANALYST_GROUP
+from .permissions import (
+    ADMIN_GROUP, ANALYST_GROUP, CanAnalyze, CanView, REVIEWER_GROUP,
+    SUPER_ADMIN_GROUP, has_any_role,
+)
 from .plan_audit_common import (
     audit_payload, get_visible_audit, get_visible_import, is_admin,
     import_payload, parse_iso_date, visible_organizations,
@@ -87,6 +90,18 @@ def _source_period(value):
 
 def _validate_summary(content, plan, manifest):
     errors, rows, keys, periods = [], [], set(), set()
+    provenance = manifest.get("source_provenance")
+    if (not isinstance(provenance, dict)
+            or not re.fullmatch(r"[a-fA-F0-9]{64}", str(provenance.get("source_sha256", "")))
+            or provenance.get("source_format") not in {"csv", "xlsx", "xlsm"}
+            or type(provenance.get("input_records")) is not int
+            or provenance["input_records"] < 1
+            or provenance.get("plan_reference") != plan.plan_reference):
+        return [], 0, [{"row": 0, "reason": "Manifest source provenance is missing or invalid."}], "", "unknown"
+    try:
+        provenance_period = _source_period(provenance.get("source_period", ""))
+    except ValueError:
+        return [], 0, [{"row": 0, "reason": "Manifest source period is invalid."}], "", "unknown"
     try:
         text = content.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -97,8 +112,11 @@ def _validate_summary(content, plan, manifest):
     if (manifest.get("schema_version") != "1.0"
             or manifest.get("approved_fields") != APPROVED_FIELDS
             or manifest.get("raw_claims_included") is not False
-            or manifest.get("member_identifiers_included") is not False):
-        return [], 0, [{"row": 0, "reason": "Manifest schema or privacy declaration is invalid."}], "", "unknown"
+            or manifest.get("member_identifiers_included") is not False
+            or type(manifest.get("small_cell_suppression_threshold")) is not int
+            or manifest.get("small_cell_suppression_threshold") != 11
+            or manifest.get("complementary_suppression_applied") is not True):
+        return [], 0, [{"row": 0, "reason": "Manifest schema or privacy/suppression declaration is invalid."}], "", "unknown"
 
     input_rows = 0
     for line, row in enumerate(reader, start=2):
@@ -156,6 +174,8 @@ def _validate_summary(content, plan, manifest):
         errors.append({"row": 0, "reason": "Aggregate summary has no data rows."})
     if len(periods) > 1:
         errors.append({"row": 0, "reason": "All aggregate rows must share one source_period."})
+    if periods and _source_period(next(iter(periods))) != provenance_period:
+        errors.append({"row": 0, "reason": "Manifest source period does not match the aggregate CSV."})
     try:
         manifest_rows = manifest.get("aggregate_rows")
         if type(manifest_rows) is not int or manifest_rows != input_rows:
@@ -215,8 +235,11 @@ def import_plan_summary(request):
         return Response({"error": "Manifest must be a JSON object encoded as UTF-8."}, status=400)
     if (manifest.get("sha256") != digest or manifest.get("file") != _filename(upload.name)
             or manifest.get("raw_claims_included") is not False
-            or manifest.get("member_identifiers_included") is not False):
-        return Response({"error": "Manifest integrity or privacy checks failed."}, status=400)
+            or manifest.get("member_identifiers_included") is not False
+            or type(manifest.get("small_cell_suppression_threshold")) is not int
+            or manifest.get("small_cell_suppression_threshold") != 11
+            or manifest.get("complementary_suppression_applied") is not True):
+        return Response({"error": "Manifest integrity or privacy/suppression checks failed."}, status=400)
     filename = _filename(upload.name)
     if ClaimsSummaryImport.objects.filter(plan=plan, file_hash=digest).exists():
         return Response({"error": "This summary file has already been imported for the selected plan."}, status=409)
@@ -239,6 +262,13 @@ def import_plan_summary(request):
         "input_rows": input_rows, "valid_rows": input_rows, "stored_rows": input_rows,
         "rejected_rows": 0, "errors": [], "raw_claims_stored": False,
         "member_identifiers_stored": False, "manifest_sha256_verified": True,
+        "source_provenance": {
+            "source_sha256": manifest["source_provenance"]["source_sha256"].lower(),
+            "source_format": manifest["source_provenance"]["source_format"],
+            "input_records": manifest["source_provenance"]["input_records"],
+            "plan_reference": plan.plan_reference,
+            "source_period": manifest["source_provenance"]["source_period"],
+        },
     }
     try:
         with transaction.atomic():
@@ -292,12 +322,9 @@ def plan_audits(request):
     queryset = PlanAudit.objects.select_related(
         "organization", "plan", "summary_import", "created_by"
     ).filter(organization__in=visible_organizations(request.user))
-    if has_any_role(request.user, {"CLIENT", "Viewer"}):
-        queryset = queryset.filter(report_generated_at__isnull=False,
-                                   reviews__review_status="approved").distinct()
     if request.query_params.get("plan_id"):
         queryset = queryset.filter(plan_id=request.query_params["plan_id"])
-    return Response([audit_payload(item) for item in queryset[:200]])
+    return Response([audit_payload(item, request.user) for item in queryset[:200]])
 
 
 @api_view(["POST"])
@@ -325,10 +352,11 @@ def create_plan_audit(request):
         audit_name=name, reporting_period=period, created_by=request.user)
     AuditEvent.objects.create(actor=request.user, action="plan_audit_created",
                               entity_type="plan_audit", entity_id=str(item.pk))
-    return Response(audit_payload(item), status=201)
+    return Response(audit_payload(item, request.user), status=201)
 
 
 @api_view(["GET"])
 @permission_classes([CanView])
 def plan_audit_detail(request, audit_id):
-    return Response(audit_payload(get_visible_audit(request.user, audit_id)))
+    from .plan_audit_common import get_accessible_audit
+    return Response(audit_payload(get_accessible_audit(request.user, audit_id), request.user))

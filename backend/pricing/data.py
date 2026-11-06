@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import duckdb
@@ -28,7 +29,11 @@ def files() -> dict[str, Path]:
         "comparison": stored(p["mart"], "mart", "comparison.parquet"),
         "run_info": stored(p["mart"], "mart", "run_info.json"),
         "asp": stored(p["ref"], "ref", "ref_asp.parquet"),
-        "crosswalk": stored(p["ref"], "ref", "ref_ndc_hcpcs.parquet"),
+        "crosswalk": (
+            stored(p["ref"], "ref", "ref_crosswalk.parquet")
+            if (p["ref"] / "ref_crosswalk.parquet").is_file()
+            else stored(p["ref"], "ref", "ref_ndc_hcpcs.parquet")
+        ),
         "ndc_products": stored(p["ref"], "ref", "ref_ndc_product.parquet"),
         "ndc_packages": stored(p["ref"], "ref", "ref_ndc_package.parquet"),
         "hospitals_ref": stored(p["ref"], "ref", "ref_hospitals.parquet"),
@@ -47,14 +52,74 @@ def _path(name: str) -> str:
     return f.as_posix()
 
 
+# Columns written by older load_asp.py versions.
+_ASP_OLD_TO_NEW = {
+    "period": "quarter",
+    "dosage": "dosage_text",
+    "description": "short_description",
+}
+
+
+def _asp_read_expr(path: str, source: str) -> str:
+    """Return a Parquet expression with legacy ASP columns aliased canonically."""
+    con = duckdb.connect()
+    try:
+        cols = {row[0] for row in con.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?)", [path]).fetchall()}
+    finally:
+        con.close()
+
+    old_cols = set(_ASP_OLD_TO_NEW) & cols
+    aliases = ", ".join(
+        f'"{old}" AS "{new}"'
+        for old, new in _ASP_OLD_TO_NEW.items()
+        if old in old_cols and new not in cols
+    )
+    parquet = f"read_parquet({source})"
+    return f"(SELECT *, {aliases} FROM {parquet})" if aliases else parquet
+
+
+_QUERY_BIND_TOKEN = re.compile(r"__pricing_parquet_[A-Za-z0-9_]+__|\?")
+
+
 def query(sql: str, params: list | None = None, **tables: str) -> list[dict]:
-    """Run SQL where {cmp}, {asp}, {quality} are replaced by read_parquet(...)."""
+    """Run SQL with parameter-bound Parquet scans; normalize legacy ASP columns."""
     if "comparison" in tables.values():
         require_current_scope()
     con = duckdb.connect()
     try:
-        sub = {k: f"read_parquet('{_path(v)}')" for k, v in tables.items()}
-        cur = con.execute(sql.format(**sub), params or [])
+        sub, scan_paths, materialized = {}, {}, []
+        for index, (key, value) in enumerate(tables.items()):
+            path = _path(value)
+            marker = f"__pricing_parquet_{index}__"
+            scan_paths[marker] = path
+            source = _asp_read_expr(path, marker) if value == "asp" else f"read_parquet({marker})"
+            if value == "comparison":
+                relation = f'"_pricing_parquet_{index}"'
+                materialized.append(f"{relation} AS MATERIALIZED (SELECT * FROM {source})")
+                sub[key] = relation
+            else:
+                sub[key] = source
+
+        values, value_index, bound = list(params or []), 0, []
+
+        def bind(match):
+            nonlocal value_index
+            token = match.group(0)
+            if token in scan_paths:
+                bound.append(scan_paths[token])
+            else:
+                if value_index >= len(values):
+                    return token
+                bound.append(values[value_index])
+                value_index += 1
+            return "?"
+
+        prefix = f"WITH {', '.join(materialized)} " if materialized else ""
+        statement = _QUERY_BIND_TOKEN.sub(bind, prefix + sql.format(**sub))
+        if value_index != len(values):
+            raise ValueError("SQL parameter count does not match the supplied parameters.")
+        cur = con.execute(statement, bound)
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
     finally:

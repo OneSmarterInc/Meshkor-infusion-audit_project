@@ -4,6 +4,7 @@ import { Loading, Table } from "../components.jsx";
 
 export default function UnitValidation({ user }) {
   const canReview = user?.roles?.some((role) => ["SUPER_ADMIN", "REVIEWER", "Admin"].includes(role));
+  const canViewFinancials = user?.roles?.some((role) => ["SUPER_ADMIN", "Admin"].includes(role));
   const state = useApi("drug-unit-validations");
   const [version, setVersion] = useState(0);
   const scope = useApi("drug-selection-scope", null, [version]);
@@ -20,7 +21,7 @@ export default function UnitValidation({ user }) {
         clinical_reviewer_name: form.get("clinical_reviewer_name"),
         billing_unit: drug.billing_unit?.unit, billing_qty: drug.billing_unit?.qty,
       });
-      setMessages((m) => ({ ...m, [drug.hcpcs]: "Review recorded. Run the Admin data refresh to apply it to Parquet and rebuild the report." }));
+      setMessages((m) => ({ ...m, [drug.hcpcs]: "Review recorded. An Admin must refresh the data pipeline before audit calculations use this decision." }));
       setVersion((v) => v + 1);
     } catch (error) { setMessages((m) => ({ ...m, [drug.hcpcs]: error.message })); }
     finally { setBusy(""); }
@@ -34,16 +35,19 @@ export default function UnitValidation({ user }) {
       <section><h2>Unit and benchmark exceptions</h2><Table rows={result.rows || []} columns={[
         { key: "hcpcs", label: "HCPCS" }, { key: "drug_name", label: "Drug" },
         { key: "hospital_label", label: "Hospital" }, { key: "status", label: "Status" },
-        { key: "price", label: "Posted price", num: true, render: (r) => fmt.usd(r.price) },
         { key: "drug_unit", label: "Original unit", render: (r) => [r.drug_unit, r.drug_unit_type].filter(Boolean).join(" ") || "—" },
         { key: "billing_units", label: "HCPCS units", num: true }, { key: "unit_note", label: "Conversion note" },
-        { key: "asp_payment_limit", label: "ASP limit", num: true, render: (r) => fmt.usd(r.asp_payment_limit) },
-        { key: "markup_multiple", label: "Markup", num: true, render: (r) => fmt.x(r.markup_multiple) },
         { key: "source_file", label: "Source file" },
+        ...(canViewFinancials ? [
+          { key: "price", label: "Posted price", num: true, render: (r) => fmt.usd(r.price) },
+          { key: "asp_payment_limit", label: "ASP limit", num: true, render: (r) => fmt.usd(r.asp_payment_limit) },
+          { key: "markup_multiple", label: "Markup", num: true, render: (r) => fmt.x(r.markup_multiple) },
+        ] : []),
       ]} empty="No unit exceptions are available for the current scope." /></section>
     </>}</Loading>
     <Loading state={scope}>{(selected) => <section><h2>CMS billing-unit review</h2>
       <p className="muted">Review decisions are tied to the exact CMS Part B source hash. Approval requires the billing quantity and unit to match the source ASP dosage.</p>
+      {selected.source_sha256 && <p className="muted">Selected scope SHA-256: {selected.source_sha256}</p>}
       {selected.status === "blocked" ? <div className="note">{selected.reason}</div> : <>
         <p className="muted">After recording all reviews, run the Admin data refresh so the saved decisions are applied to Parquet and the comparison/report are rebuilt.</p>
         {(selected.drugs || []).map((drug) => <article className="review-card" key={drug.hcpcs}>
@@ -51,10 +55,10 @@ export default function UnitValidation({ user }) {
           {drug.unit_review?.clinical_reviewer_name && <div className="muted">Clinical reviewer: {drug.unit_review.clinical_reviewer_name} · {drug.unit_review.reviewed_at ? new Date(drug.unit_review.reviewed_at).toLocaleDateString() : "date unavailable"}</div>}
           {drug.unit_review?.notes && <div className="muted">Previous rationale: {drug.unit_review.notes}</div>}</div>
         <form className="review-form" onSubmit={(e) => saveReview(e, drug)}>
-          <select name="status" aria-label={`Review status for ${drug.hcpcs}`} defaultValue="validated"><option value="validated">Validated</option><option value="rejected">Rejected</option><option value="unit_unresolved">Unit unresolved</option></select>
+          <select name="status" aria-label={`Review status for ${drug.hcpcs}`} defaultValue="" required><option value="" disabled>Select a review decision</option><option value="validated">Validated</option><option value="rejected">Rejected</option><option value="unit_unresolved">Unit unresolved</option></select>
           <input name="clinical_reviewer_name" aria-label={`Clinical reviewer for ${drug.hcpcs}`} placeholder="External pharmacist / clinical reviewer name" defaultValue={drug.unit_review?.clinical_reviewer_name || ""} required minLength={3} />
           <input name="notes" aria-label={`Review note for ${drug.hcpcs}`} placeholder="Evidence and rationale (required for every decision)" required minLength={10} defaultValue={drug.unit_review?.notes || ""} />
-          <button disabled={busy === drug.hcpcs || !canReview}>{busy === drug.hcpcs ? "Saving…" : "Record clinical sign-off"}</button>
+          <button disabled={busy === drug.hcpcs || !canReview || !drug.billing_unit?.unit || drug.billing_unit?.qty == null || !drug.asp_dosage}>{busy === drug.hcpcs ? "Saving…" : "Record clinical sign-off"}</button>
         </form>
         {messages[drug.hcpcs] && <p className="muted" role="status">{messages[drug.hcpcs]}</p>}
         </article>)}

@@ -18,5 +18,8 @@ urlpatterns = [
     path("rates.csv", views.rates_csv, name="legacy_v0_price_comparisons_csv_export"),
     path("rates.xlsx", views.rates_xlsx, name="legacy_v0_price_comparisons_excel_export"),
     path("report.pdf", views.report_pdf, name="legacy_v0_market_analysis_pdf_report"),
+    path("reports/evaluations", views.broker_evaluations, name="legacy_v0_broker_evaluations"),
+    path("reports/evaluations/<int:evaluation_id>", views.broker_evaluation_detail, name="legacy_v0_broker_evaluation_detail"),
+    path("reports/evaluation-package", views.evaluation_package, name="legacy_v0_evaluation_package"),
     path("quality", views.quality, name="legacy_v0_hospital_file_quality"),
 ]

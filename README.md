@@ -43,9 +43,18 @@ analytics are not stored in SQLite or PostgreSQL.
 - `data/raw_essential_inputs/`: optional retained source files for import and
   provenance. Data files and local secrets are excluded from Git.
 
-See [`docs/DATA_SCHEMA.md`](docs/DATA_SCHEMA.md) for the storage contract and
-[`config/report.json`](config/report.json) for required and supplemental input
-file patterns.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the system architecture,
+storage contracts, and security boundaries; see [`config/report.json`](config/report.json)
+for required and supplemental input file patterns.
+
+## Documentation
+
+The project maintains five core documents:
+- [`README.md`](README.md): Project overview, installation, and local execution.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): System architecture, Parquet/SQLite storage contracts, Phase 1/2/4 workflows, and security boundaries.
+- [`docs/API_ENDPOINTS.md`](docs/API_ENDPOINTS.md): Supported API endpoints, request contracts, and frontend routes.
+- [`docs/PROJECT_HANDOFF.md`](docs/PROJECT_HANDOFF.md): Active progress tracker, completed work, verified test results, blockers, and next steps.
+- [`docs/PHASE4_PLAN_AUDITS.md`](docs/PHASE4_PLAN_AUDITS.md): Client-side extractor guide, onboarding, privacy suppression, and plan audit calculation rules.
 
 ## Run locally on Windows
 
@@ -126,7 +135,9 @@ analysis, payer-file analysis, or multi-organization workspaces.
 ## Verification
 
 ```powershell
-python -m pytest
+python backend\manage.py check
+python backend\manage.py migrate --check
+python -m pytest -q
 Set-Location frontend
 npm run build
 ```

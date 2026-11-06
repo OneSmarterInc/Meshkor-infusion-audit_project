@@ -1,0 +1,32 @@
+{
+  "file": "claims_summary.csv",
+  "sha256": "5fcc2ca0fd59240beb5481f3e99f49fb03c93d9abf4150dd75b8536d4ad51594",
+  "schema_version": "1.0",
+  "approved_fields": [
+    "plan_reference",
+    "hcpcs_code",
+    "site_npi",
+    "quarter",
+    "service_setting",
+    "total_units",
+    "total_allowed_amount",
+    "total_paid_amount",
+    "member_count_band",
+    "source_period",
+    "extraction_timestamp",
+    "schema_version"
+  ],
+  "aggregate_rows": 2,
+  "created_at": "2026-11-06T04:49:51+00:00",
+  "raw_claims_included": false,
+  "member_identifiers_included": false,
+  "small_cell_suppression_threshold": 11,
+  "complementary_suppression_applied": true,
+  "source_provenance": {
+    "source_sha256": "a34d4c21f894967da064c1dd320945819a53096cef4a16ce52814049d7fc36e3",
+    "source_format": "csv",
+    "input_records": 22,
+    "source_period": "2026-10-15/2026-10-15",
+    "plan_reference": "RG01-F49C3AB5"
+  }
+}

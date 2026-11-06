@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 const API_ROOT = import.meta.env.VITE_API_BASE_URL || "/api/v1";
 let accessToken = null;
+let refreshPromise = null;
 const API_ENDPOINTS = Object.freeze({
   csrfToken: "authentication/csrf-token",
   signIn: "authentication/sign-in",
@@ -20,16 +21,21 @@ function csrfCookie() {
   return document.cookie.split(";").map((v) => v.trim()).find((v) => v.startsWith("csrftoken="))?.slice(10) || "";
 }
 
-async function request(path, options = {}) {
+async function request(path, options = {}, { skipBearer = false, retryAuth = true } = {}) {
   const method = options.method || "GET";
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  if (accessToken && !skipBearer) headers.Authorization = `Bearer ${accessToken}`;
   if (!["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase())) headers["X-CSRFToken"] = csrfCookie();
   const rawPath = path;
   const queryIndex = rawPath.indexOf("?");
   const endpoint = queryIndex < 0 ? rawPath : rawPath.slice(0, queryIndex);
   const query = queryIndex < 0 ? "" : rawPath.slice(queryIndex);
   const cleanPath = endpoint.split("/").filter(Boolean).join("/");
+  const canRefresh = ![
+    API_ENDPOINTS.csrfToken, API_ENDPOINTS.signIn, API_ENDPOINTS.totpSetup,
+    API_ENDPOINTS.totpConfirmation, API_ENDPOINTS.totpSignInVerification,
+    API_ENDPOINTS.refreshAccessToken, API_ENDPOINTS.signOut,
+  ].includes(cleanPath);
   const res = await fetch(`${API_ROOT}/${cleanPath}/${query}`, {
     ...options, method, headers, credentials: "same-origin",
   });
@@ -37,7 +43,37 @@ async function request(path, options = {}) {
   if (!res.ok) {
     const error = new Error(body.error || `${res.status} ${res.statusText}`);
     error.status = res.status;
+    error.code = body.code;
     error.retryAfterSeconds = Number(body.retry_after_seconds) || 0;
+    if (res.status === 401 && accessToken && cleanPath !== API_ENDPOINTS.refreshAccessToken) {
+      if (retryAuth && canRefresh) {
+        try {
+          if (!refreshPromise) {
+            refreshPromise = request(API_ENDPOINTS.refreshAccessToken, {
+              method: "POST", body: "{}",
+            }, { skipBearer: true, retryAuth: false })
+              .then((refreshed) => {
+                accessToken = refreshed.access;
+                return refreshed;
+              })
+              .catch((refreshError) => {
+                accessToken = null;
+                window.dispatchEvent(new Event("meshkor:session-expired"));
+                throw refreshError;
+              })
+              .finally(() => { refreshPromise = null; });
+          }
+          await refreshPromise;
+          return request(path, options, { retryAuth: false });
+        } catch {
+          throw error;
+        }
+      }
+      if (!retryAuth) {
+        accessToken = null;
+        window.dispatchEvent(new Event("meshkor:session-expired"));
+      }
+    }
     throw error;
   }
   return body;
@@ -49,6 +85,7 @@ export async function getJSON(path, params) {
 }
 
 export async function login(username, password) {
+  accessToken = null;
   await request(API_ENDPOINTS.csrfToken);
   const result = await request(API_ENDPOINTS.signIn, { method: "POST", body: JSON.stringify({ username, password }) });
   accessToken = result.access;
@@ -145,6 +182,10 @@ function clean(p) {
 export function useApi(path, params, deps = []) {
   const [state, set] = useState({ data: null, error: null, loading: true });
   useEffect(() => {
+    if (!path) {
+      set({ data: null, error: null, loading: false });
+      return;
+    }
     let live = true;
     set((s) => ({ ...s, loading: true }));
     getJSON(path, params)
@@ -216,6 +257,10 @@ export async function uploadNetworkRoster(planId, rosterFile) {
   const form = new FormData();
   form.append("file", rosterFile);
   return uploadForm("plans/" + planId + "/network-roster/", form);
+}
+
+export async function patchJSON(path, body = {}) {
+  return request(path, { method: "PATCH", body: JSON.stringify(body) });
 }
 
 export async function deleteJSON(path) {

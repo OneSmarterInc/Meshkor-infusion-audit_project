@@ -16,6 +16,8 @@ from pipeline.load_asp import classify
 from pipeline.select_drugs import apply_saved_scope_reviews
 from pipeline.build_compare import comparison_metrics, resolve_benchmark_quarter
 from pipeline.parse_hpt import _json_stream
+from client_extractor.src.processing.aggregate_claims import aggregate_claims
+from client_extractor.src.export.summary_export import export_summary
 
 
 # ---------- unit helpers ----------
@@ -38,6 +40,64 @@ def test_csv_exports_neutralize_spreadsheet_formulas(raw):
 def test_csv_safe_cell_leaves_numbers_and_plain_text_unchanged():
     assert csv_safe_cell(-1.25) == -1.25
     assert csv_safe_cell("ordinary text") == "ordinary text"
+
+
+def _claims_for_site(site_npi, member_count):
+    return [{
+        "hcpcs_code": "J9271", "site_npi": site_npi,
+        "service_date": date(2026, 1, 15), "service_setting": "outpatient",
+        "units": Decimal("1.250000"), "allowed_amount": Decimal("100.01"),
+        "paid_amount": Decimal("80.01"), "member_id": f"{site_npi}-{index}",
+    } for index in range(member_count)]
+
+
+def test_claims_extractor_suppresses_small_and_complementary_cells(tmp_path):
+    billing_units = {"J9271": {"qty": Decimal("1"), "unit": "UNIT"}}
+    small_cell, small_quality = aggregate_claims(
+        _claims_for_site("1000000004", 10), plan_reference="PLAN-TEST",
+        source_period="2026-01-01/2026-03-31", extracted_at="2026-04-01T00:00:00+00:00",
+        billing_units=billing_units,
+    )
+    assert small_cell == []
+    assert small_quality["reasons"]["small_cell_suppressed"] == 1
+
+    rows, quality = aggregate_claims(
+        _claims_for_site("1000000004", 10)
+        + _claims_for_site("1000000012", 11)
+        + _claims_for_site("1000000020", 14),
+        plan_reference="PLAN-TEST", source_period="2026-01-01/2026-03-31",
+        extracted_at="2026-04-01T00:00:00+00:00", billing_units=billing_units,
+    )
+    assert len(rows) == 1
+    assert rows[0]["site_npi"] == "1000000020"
+    assert quality["reasons"]["small_cell_suppressed"] == 1
+    assert quality["reasons"]["complementary_suppressed"] == 1
+    assert "member_id" not in rows[0]
+    assert "_member_count_for_local_suppression" not in rows[0]
+
+    _, manifest_path, _ = export_summary(rows, tmp_path, source_provenance={
+        "source_sha256": "a" * 64, "source_format": "csv", "input_records": 35,
+        "source_period": "2026-01-01/2026-03-31", "plan_reference": "PLAN-TEST",
+    })
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["small_cell_suppression_threshold"] == 11
+    assert manifest["complementary_suppression_applied"] is True
+    assert manifest["member_identifiers_included"] is False
+    assert manifest["source_provenance"]["plan_reference"] == "PLAN-TEST"
+
+
+def test_claims_aggregate_precision_is_exact_or_explicitly_excluded():
+    claims = _claims_for_site("1000000004", 11)
+    for row in claims:
+        row["allowed_amount"] = Decimal("999999999999999999")
+        row["paid_amount"] = Decimal("999999999999999999")
+    rows, quality = aggregate_claims(
+        claims, plan_reference="PLAN-TEST", source_period="2026-01-01/2026-03-31",
+        extracted_at="2026-04-01T00:00:00+00:00",
+        billing_units={"J9271": {"qty": Decimal("1"), "unit": "UNIT"}},
+    )
+    assert rows == []
+    assert quality["reasons"]["aggregate_exceeds_import_precision"] == 1
 
 
 def test_file_date_quarter_does_not_fall_back_to_latest_asp():

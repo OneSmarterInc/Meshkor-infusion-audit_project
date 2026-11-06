@@ -1,0 +1,9 @@
+hcpcs_billing_units:
+  J9271:
+    qty: 1
+    source_reference: Synthetic browser fixture only
+    source_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    unit: MG
+    verification_status: validated
+plan_id: RG01-SYNTHETIC-PLAN
+plan_reference: RG01-91B20241

@@ -30,6 +30,8 @@ urlpatterns = [
     path("plan-audits/<int:audit_id>/run/", run.run_audit, name="plan_audit_run"),
     path("plan-audits/<int:audit_id>/overview/", run.audit_overview, name="plan_audit_overview"),
     path("plan-audits/<int:audit_id>/results/", run.audit_results, name="plan_audit_results"),
+    path("plan-audits/<int:audit_id>/historical-spending/", run.historical_spending,
+         name="plan_audit_historical_spending"),
     path("plan-audits/<int:audit_id>/drug-analysis/", run.drug_analysis, name="plan_audit_drug_analysis"),
     path("plan-audits/<int:audit_id>/hospital-comparison/", run.hospital_comparison,
          name="plan_audit_hospital_comparison"),
