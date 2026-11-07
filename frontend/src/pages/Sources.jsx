@@ -1,13 +1,15 @@
 import { useEffect, useState } from "react";
 import { getJSON, postJSON, uploadSource, useApi, fmt } from "../api.js";
-import { Loading } from "../components.jsx";
+import { fileName, Loading } from "../components.jsx";
+import { hasRole } from "../rolePolicy.js";
 
 function todayLocal() {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 }
 
-export default function Sources() {
+export default function Sources({ user }) {
+  const canManageSources = hasRole(user, "SUPER_ADMIN");
   const [version, setVersion] = useState(0);
   const [sourceKey, setSourceKey] = useState("");
   const [file, setFile] = useState(null);
@@ -39,8 +41,8 @@ export default function Sources() {
       const result = await uploadSource(sourceKey, file, { system, snapshotDate });
       setUploaded({ sourceKey, result, fileName: file.name });
       setMessage(result.duplicate
-        ? "This source file is already stored. Run the import to convert it into the project’s Parquet datasets."
-        : `Stored ${file.name}. Run the import to convert it into Parquet and update the dashboard.`);
+        ? "This source file is already stored. Run the import to process and update the dashboard."
+        : `Stored ${file.name}. Run the import to update the dashboard.`);
       setFile(null);
       event.target.reset();
       setVersion((v) => v + 1);
@@ -60,9 +62,10 @@ export default function Sources() {
   }
 
   return <>
-    <h1>Sources & uploads</h1>
-    <p className="lede">Upload source files, then import them to rebuild the dashboard from the saved data.</p>
-    <section>
+    <p className="lede">{canManageSources
+      ? "Upload and import platform source files to refresh the dashboard."
+      : "Review platform source availability and processing status."}</p>
+    {canManageSources && <section>
       <h2>Add a source file</h2>
       <form className="filters" onSubmit={submit}>
         <select aria-label="Input type" value={sourceKey} onChange={(e) => setSourceKey(e.target.value)} required>
@@ -82,23 +85,20 @@ export default function Sources() {
           {busy ? "Uploading…" : "Upload file"}
         </button>
       </form>
-      <p className="muted">The import step converts supported uploads into the project’s Parquet datasets. After import, dashboard and comparison reads use Parquet; originals remain stored for source lineage. Hospital MRF uploads need a system key and snapshot date.</p>
       {message && <p role="status" className="success-message">{message}</p>}
       {error && <p role="alert" className="note error">{error}</p>}
       {uploaded && <div className="import-action">
-        <p>Ready to convert <b>{uploaded.fileName}</b> into the project’s Parquet datasets.</p>
+        <p>Ready to process <b>{uploaded.fileName}</b> and refresh the dashboard.</p>
         <button className="button" type="button" onClick={importData} disabled={busy || ["queued", "running"].includes(job?.status)}>
           {busy ? "Queueing…" : "Import data and rebuild dashboard"}
         </button>
       </div>}
-    </section>
+    </section>}
     {job && <section aria-live="polite">
       <h2>Import job {job.id}</h2>
       <p><b>{job.status}</b>{job.progress != null ? ` · ${job.progress}%` : ""}</p>
-      {job.status === "queued" && <p className="note">The job is queued. Start the data worker from the backend folder with <code>python manage.py process_jobs</code>.</p>}
-      {job.status === "failed" && <pre className="note error import-log">{job.error || job.summary?.output_tail || "The import failed without a diagnostic message."}</pre>}
-      {job.status === "succeeded" && <p className="success-message">Import complete. {fmt.n(job.summary?.parquet_converted_sources || 0)} uploaded source file(s) were converted. The dashboard and comparisons now read the saved Parquet datasets; original uploads are retained for audit history.</p>}
-      {job.summary?.output_tail && job.status === "running" && <details><summary>Import log</summary><pre className="import-log">{job.summary.output_tail}</pre></details>}
+      {job.status === "failed" && <p className="note error" role="alert">Import could not be completed. Check the source file and try again. If the issue continues, contact an administrator.</p>}
+      {job.status === "succeeded" && <p className="success-message">Import complete. {fmt.n(job.summary?.parquet_converted_sources || 0)} source file(s) processed and updated successfully.</p>}
     </section>}
     <Loading state={jobs}>{(rows) => rows.length > 0 && <section>
       <h2>Recent imports</h2>
@@ -111,7 +111,7 @@ export default function Sources() {
         <p className="muted">{s.purpose} · {s.required ? "Required for market report" : "Supplemental / later phase"}</p>
         <p><b>{fmt.n(s.file_count)}</b> file{ s.file_count === 1 ? "" : "s"}</p>
         {s.files.length > 0 && <details><summary>Show files</summary><ul className="source-files">
-          {s.files.map((f) => <li key={f.path}><span>{f.path} · {fmt.n(f.size_bytes)} bytes</span></li>)}
+          {s.files.map((f) => <li key={f.path}><span>{fileName(f.path)} · {fmt.n(f.size_bytes)} bytes</span></li>)}
         </ul></details>}
       </article>)}</div>
     </section>}</Loading>

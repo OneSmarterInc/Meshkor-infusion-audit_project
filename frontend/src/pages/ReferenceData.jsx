@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { getJSON, fmt } from "../api.js";
-import { Loading, Table } from "../components.jsx";
+import { isInternalColumn, Loading, Table } from "../components.jsx";
 
 const PAGE_SIZE = 100;
 const labels = {
@@ -30,13 +30,26 @@ export default function ReferenceData() {
 
   const loaded = catalog.data?.filter((r) => r.status === "loaded").length || 0;
   const chosen = catalog.data?.find((r) => r.key === table);
-  const columns = (data.data?.columns || []).slice(0, 12).map((key) => ({
+  const columns = (data.data?.columns || []).filter((key) => !isInternalColumn(key)).slice(0, 12).map((key) => ({
     key, label: key.replaceAll("_", " "),
-    render: (row) => row[key] == null ? "—" : typeof row[key] === "object" ? JSON.stringify(row[key]) : String(row[key]),
+    render: (row) => {
+      const val = row[key];
+      if (val == null) return "—";
+      if (typeof val === "object") return JSON.stringify(val);
+      const str = String(val);
+      if (str.startsWith("http://") || str.startsWith("https://")) {
+        try {
+          const u = new URL(str);
+          return <a href={str} target="_blank" rel="noopener noreferrer" title={str}>{u.hostname}</a>;
+        } catch {
+          return str;
+        }
+      }
+      return str;
+    },
   }));
   return <>
-    <h1>Reference data</h1>
-    <p className="lede">Searchable CMS, FDA, and provider reference tables. Loaded status, periods, lineage, and known gaps come from the current local Parquet outputs.</p>
+    <p className="lede">Browse CMS, FDA, and provider reference data.</p>
     <section><div className="stats"><div className="stat"><div className="stat-label">Reference tables loaded</div><div className="stat-value">{fmt.n(loaded)} / {fmt.n(catalog.data?.length)}</div></div></div></section>
     <Loading state={catalog}>{(rows) => <section>
       <h2>Source tables</h2>

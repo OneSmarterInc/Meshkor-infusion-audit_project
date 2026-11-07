@@ -246,7 +246,7 @@ function HistoricalSpendingSection({ auditId, audit, metrics }) {
         />
         <ul className="plan-audit-quality">
           <li>To populate this view, the employer/TPA must supply a claims export to the local extractor.</li>
-          <li>The extractor produces <code>claims_summary.csv</code> and <code>manifest.json</code>.</li>
+          <li>The extractor produces standardized claims summary and verification manifest files.</li>
           <li>An Analyst imports those files under Plan Setup → Import approved aggregates.</li>
           <li>An Analyst then creates and runs a Plan Audit.</li>
           <li>Synthetic datasets (CMS DE-SynPUF and Synthea Synthetic Demo) are available only in the separate Claims Explorer.</li>
@@ -680,17 +680,39 @@ function DrugCostSection({ auditId, audit }) {
 // ---------------------------------------------------------------------------
 function ProviderNetworkSection({ auditId, audit }) {
   const [rows, setRows] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [nextOffset, setNextOffset] = useState(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     setRows([]);
+    setTotal(0);
+    setNextOffset(null);
+    setError("");
     if (!auditId) return undefined;
     let alive = true;
-    getJSON(`plan-audits/${auditId}/network-validation/`)
-      .then((data) => alive && setRows(data || []))
+    getJSON(`plan-audits/${auditId}/network-validation/`, { limit: 200, offset: 0 })
+      .then((data) => {
+        if (!alive) return;
+        setRows(data.results || []);
+        setTotal(data.count || 0);
+        setNextOffset(data.next_offset);
+      })
       .catch((e) => alive && setError(e.message));
     return () => { alive = false; };
   }, [auditId]);
+
+  async function loadMore() {
+    if (nextOffset == null) return;
+    setLoadingMore(true); setError("");
+    try {
+      const data = await getJSON(`plan-audits/${auditId}/network-validation/`, { limit: 200, offset: nextOffset });
+      setRows((current) => [...current, ...(data.results || [])]);
+      setNextOffset(data.next_offset);
+    } catch (e) { setError(e.message); }
+    finally { setLoadingMore(false); }
+  }
 
   if (!audit) return <EmptyState message="Select a completed audit to view provider and network analysis." />;
 
@@ -714,7 +736,7 @@ function ProviderNetworkSection({ auditId, audit }) {
           a roster interval covers the full reporting quarter. No status is inferred from facility names.
         </p>
         <ErrorBox error={error} />
-        {Object.keys(bySite).length > 0 ? (
+        {rows.length > 0 ? (
           <div className="table-wrap">
             <table className="executive-table">
               <thead>
@@ -743,6 +765,9 @@ function ProviderNetworkSection({ auditId, audit }) {
             sub="Import a plan network roster and run the audit to see provider network status."
           />
         )}
+        {rows.length > 0 && <div className="table-footer-links"><span>Showing {rows.length.toLocaleString()} of {total.toLocaleString()} result rows</span>
+          {nextOffset != null && <button type="button" className="button secondary" onClick={loadMore} disabled={loadingMore}>{loadingMore ? "Loading…" : "Load more"}</button>}
+        </div>}
         <p className="muted" style={{ marginTop: "0.5rem" }}>
           Unknown or expired network evidence is shown as-is.
           Provider names shown here, if any, are from the roster file and are not independently verified.
@@ -757,17 +782,39 @@ function ProviderNetworkSection({ auditId, audit }) {
 // ---------------------------------------------------------------------------
 function SavingsSection({ auditId, audit }) {
   const [savings, setSavings] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [nextOffset, setNextOffset] = useState(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     setSavings([]);
+    setTotal(0);
+    setNextOffset(null);
+    setError("");
     if (!auditId) return undefined;
     let alive = true;
-    getJSON(`plan-audits/${auditId}/savings/`)
-      .then((data) => alive && setSavings(data || []))
+    getJSON(`plan-audits/${auditId}/savings/`, { limit: 200, offset: 0 })
+      .then((data) => {
+        if (!alive) return;
+        setSavings(data.results || []);
+        setTotal(data.count || 0);
+        setNextOffset(data.next_offset);
+      })
       .catch((e) => alive && setError(e.message));
     return () => { alive = false; };
   }, [auditId]);
+
+  async function loadMore() {
+    if (nextOffset == null) return;
+    setLoadingMore(true); setError("");
+    try {
+      const data = await getJSON(`plan-audits/${auditId}/savings/`, { limit: 200, offset: nextOffset });
+      setSavings((current) => [...current, ...(data.results || [])]);
+      setNextOffset(data.next_offset);
+    } catch (e) { setError(e.message); }
+    finally { setLoadingMore(false); }
+  }
 
   if (!audit) return <EmptyState message="Select a completed audit to view savings opportunities." />;
 
@@ -829,6 +876,9 @@ function SavingsSection({ auditId, audit }) {
             sub="Opportunities require: validated billing units, a lower-priced in-network alternative for the same HCPCS and quarter, and verified full-quarter roster coverage for the alternative site."
           />
         )}
+        {savings.length > 0 && <div className="table-footer-links"><span>Showing {savings.length.toLocaleString()} of {total.toLocaleString()} opportunities</span>
+          {nextOffset != null && <button type="button" className="button secondary" onClick={loadMore} disabled={loadingMore}>{loadingMore ? "Loading…" : "Load more"}</button>}
+        </div>}
       </section>
     </div>
   );
@@ -1086,6 +1136,7 @@ function PlanSetupSection({
   error, setError, setErrorDetails, setNotice, setBusy,
 }) {
   const assignedUserIds = new Set(accessRows.map((row) => String(row.user_id)));
+  const acceptedImports = imports.filter((item) => item.import_status === "accepted");
   const assignableUsers = viewerUsers.filter((item) => !assignedUserIds.has(String(item.id)));
   const roleLabels = { ANALYST: "Analyst", REVIEWER: "Reviewer", CLIENT: "Client", Viewer: "Legacy Viewer" };
   async function act(action, success) {
@@ -1237,7 +1288,7 @@ function PlanSetupSection({
               />
             </label>
             <p className="muted">
-              Upload only the local extractor&apos;s claims_summary.csv and manifest.json.
+              Upload only the local extractor claims summary and manifest files.
               Raw claims must stay in the client environment.
             </p>
             <button
@@ -1252,7 +1303,7 @@ function PlanSetupSection({
               <div className="plan-audit-quality" role="status">
                 <p>Privacy declarations and aggregate CSV SHA-256 verified locally.</p>
                 <p>Source period: {summaryPreview.sourcePeriod}; aggregate rows: {count(summaryPreview.rowCount)}.</p>
-                <p>Source input SHA-256: <code className="plan-audit-hash">{summaryPreview.sourceHash}</code></p>
+                <p>Verification: <span className="pill s-ok">Verified</span> <code className="plan-audit-hash" title={summaryPreview.sourceHash}>{summaryPreview.sourceHash ? `${summaryPreview.sourceHash.slice(0, 8)}…${summaryPreview.sourceHash.slice(-6)}` : "Verified"}</code></p>
               </div>
             )}
             <button disabled={busy || !summaryPreview}>
@@ -1295,7 +1346,7 @@ function PlanSetupSection({
             {rosterImportResult && String(rosterImportResult.plan_id) === String(planId) && (
               <p className="muted" role="status">
                 {count(rosterImportResult.accepted_rows)} roster rows accepted. Source file retained: no.
-                SHA-256: <code className="plan-audit-hash">{rosterImportResult.sha256}</code>
+                Checksum: <code className="plan-audit-hash" title={rosterImportResult.sha256}>{rosterImportResult.sha256 ? `${rosterImportResult.sha256.slice(0, 8)}…${rosterImportResult.sha256.slice(-6)}` : "Verified"}</code>
               </p>
             )}
           </>
@@ -1318,7 +1369,7 @@ function PlanSetupSection({
                 const item = await postJSON("plan-audits/create/", {
                   organization_id: organizationId,
                   plan_id: planId,
-                  summary_import_id: form.get("summary_import_id") || importId,
+                  summary_import_id: form.get("summary_import_id") || selectedImport?.id || importId,
                   audit_name: form.get("audit_name"),
                   reporting_period: form.get("reporting_period"),
                 });
@@ -1327,7 +1378,7 @@ function PlanSetupSection({
               }, "Plan audit created.");
             }}
           >
-            {imports.length > 1 && (
+            {acceptedImports.length > 1 && (
               <label className="plan-audit-field">
                 Summary import
                 <select
@@ -1336,7 +1387,7 @@ function PlanSetupSection({
                   onChange={(e) => setImportId(e.target.value)}
                   required
                 >
-                  {imports.map((item) => (
+                  {acceptedImports.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.source_file_name} ({item.source_period || "no period"}; {item.import_status})
                     </option>
@@ -1346,6 +1397,7 @@ function PlanSetupSection({
             )}
             <Field name="audit_name" label="Audit name" maxLength="200" required />
             <Field
+              key={selectedImport.id}
               name="reporting_period"
               label="Source period"
               defaultValue={selectedImport.source_period}
@@ -1450,7 +1502,7 @@ function PlanSetupSection({
                         ? "Passed; no raw claims or member IDs stored"
                         : "Rejected or unavailable"}
                     </td>
-                    <td><code className="plan-audit-hash">{item.file_hash}</code></td>
+                    <td><code className="plan-audit-hash" title={item.file_hash}>{item.file_hash ? `${item.file_hash.slice(0, 8)}…${item.file_hash.slice(-6)}` : "—"}</code></td>
                   </tr>
                 ))}
               </tbody>
@@ -1606,13 +1658,14 @@ export default function PlanAudits({ user }) {
     if (!planId) { setImports([]); setImportId(""); setAudits([]); setAuditId(""); return undefined; }
     let alive = true;
     Promise.all([
-      getJSON("plan-audits/imports/", { plan_id: planId }),
+      analyst ? getJSON("plan-audits/imports/", { plan_id: planId }) : Promise.resolve([]),
       getJSON("plan-audits/", { plan_id: planId }),
     ]).then(([importItems, auditItems]) => {
       if (!alive) return;
       setImports(importItems); setAudits(auditItems);
-      if (!importItems.some((item) => String(item.id) === String(importId))) {
-        const preferred = importItems.find((item) => item.import_status === "accepted") || importItems[0];
+      const selectableImports = importItems.filter((item) => item.import_status === "accepted");
+      if (!selectableImports.some((item) => String(item.id) === String(importId))) {
+        const preferred = selectableImports[0];
         setImportId(preferred ? String(preferred.id) : "");
       }
       if (!auditItems.some((item) => String(item.id) === String(auditId))) {
@@ -1673,9 +1726,14 @@ export default function PlanAudits({ user }) {
     return () => { alive = false; };
   }, [admin, organizationId, refreshKey]);
 
+  const acceptedImports = useMemo(
+    () => imports.filter((item) => item.import_status === "accepted"),
+    [imports]
+  );
   const selectedImport = useMemo(
-    () => imports.find((item) => String(item.id) === String(importId)),
-    [imports, importId]
+    () => acceptedImports.find((item) => String(item.id) === String(importId)) ||
+      (!importId ? acceptedImports[0] : null),
+    [acceptedImports, importId]
   );
 
   // Load network evidence

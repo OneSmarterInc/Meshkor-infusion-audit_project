@@ -183,6 +183,12 @@ def built(data_root, monkeypatch_session):
     assert select_drugs.main() == 0
     assert parse_hpt.main() == 0
     assert build_compare.main() == 0
+    from build_market_report import build_report
+    build_report(
+        data_root / "reports", data_root / "data/mart/comparison.parquet",
+        data_root / "data/hpt/norm/hpt_file_quality.parquet",
+        data_root / "data/mart/run_info.json", root=data_root,
+    )
     return data_root
 
 

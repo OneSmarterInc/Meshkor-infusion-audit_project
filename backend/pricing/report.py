@@ -7,6 +7,7 @@ from xml.sax.saxutils import escape
 from django.conf import settings
 
 from . import data
+from pipeline.common import project_root
 
 
 def build_pdf(signoff: dict, codes: list[str] | None = None, user: str | None = None,
@@ -22,7 +23,7 @@ def build_pdf(signoff: dict, codes: list[str] | None = None, user: str | None = 
     except ImportError as exc:
         raise RuntimeError("Install the pinned ReportLab dependency to create PDF reports.") from exc
 
-    payload_path = settings.BASE_DIR.parent / "reports" / "dashboard_data.json"
+    payload_path = project_root() / "reports" / "dashboard_data.json"
     if not payload_path.exists():
         raise data.DataMissing("dashboard_data.json not found. Run: python build_market_report.py")
     payload = json.loads(payload_path.read_text(encoding="utf-8"))

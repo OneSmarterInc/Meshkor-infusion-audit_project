@@ -28,6 +28,7 @@ import polars as pl
 
 from .common import (norm_hcpcs, norm_ndc, parse_hcpcs_dosage, paths, quarter_bounds,
                      quarter_from_filename, rel, sha256, to_float, write_sha256_sidecar)
+from .artifacts import REFERENCE_ARTIFACTS
 
 
 def _key(s: object) -> str:
@@ -367,7 +368,7 @@ def main() -> int:
             all_excluded.write_parquet(excluded_tmp, compression="zstd")
             outputs.append((excluded_tmp, excluded_target))
 
-    for frames, filename in ((xw, "ref_crosswalk.parquet"),):
+    for frames, filename in ((xw, REFERENCE_ARTIFACTS["crosswalk"]),):
         if not frames:
             continue
         target = p["ref"] / filename

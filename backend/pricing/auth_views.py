@@ -1,6 +1,5 @@
 import hashlib
 import secrets
-import time
 from datetime import datetime, timedelta, timezone as datetime_timezone
 
 import jwt
@@ -11,7 +10,6 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.auth.hashers import check_password, make_password
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
-from django.core.cache import cache
 from django.core import signing
 from django.db import transaction
 from django.db.models import Q
@@ -25,7 +23,8 @@ from rest_framework.response import Response
 
 from .mfa import (mark_mfa_verified, mfa_claims_for_session,
                   mfa_session_is_valid, revoke_mfa_session)
-from .models import AdminOTPDevice, AuditEvent, DrugUnitReview, ReportRecord
+from .models import (AdminOTPDevice, AuthChallenge, AuthThrottleBucket, AuditEvent,
+                     DrugUnitReview, ReportRecord)
 from .otp import decrypt_secret, encrypt_secret, new_secret, provisioning_uri, verify_code
 from .permissions import (ADMIN_GROUP, VIEWER_GROUP, APPLICATION_ROLES, SUPER_ADMIN_GROUP,
                          CLIENT_GROUP, REVIEWER_GROUP, CanAdminister, CanReview, has_any_role)
@@ -62,9 +61,96 @@ def _access_token(request, user):
     }, settings.SECRET_KEY, algorithm="HS256")
 
 
-def _attempt_key(username, ip):
-    raw = f"{username.casefold()}|{ip}".encode("utf-8")
-    return "login-fail:" + hashlib.sha256(raw).hexdigest()
+def _auth_throttle_keys(user_id, ip, scope):
+    return sorted({
+        hashlib.sha256(f"{scope}|account|{user_id}".encode()).hexdigest(),
+        hashlib.sha256(f"{scope}|source|{ip}".encode()).hexdigest(),
+    })
+
+
+def _locked_throttle_buckets(user_id, ip, scope, now):
+    buckets = []
+    for key in _auth_throttle_keys(user_id, ip, scope):
+        AuthThrottleBucket.objects.get_or_create(key=key)
+        bucket = AuthThrottleBucket.objects.select_for_update().get(key=key)
+        if (bucket.window_started_at is None
+                or (now - bucket.window_started_at).total_seconds() >= settings.LOGIN_WINDOW_SECONDS):
+            bucket.failure_count = 0
+            bucket.window_started_at = now
+            bucket.save(update_fields=["failure_count", "window_started_at", "updated_at"])
+        buckets.append(bucket)
+    return buckets
+
+
+def _reserve_auth_attempt(user_id, ip, scope):
+    now = timezone.now()
+    with transaction.atomic():
+        AuthThrottleBucket.objects.filter(updated_at__lt=now - timedelta(days=30)).delete()
+        buckets = _locked_throttle_buckets(user_id, ip, scope, now)
+        retries = [max(1, settings.LOGIN_WINDOW_SECONDS - int((now - row.window_started_at).total_seconds()))
+                   for row in buckets if row.failure_count >= min(settings.LOGIN_MAX_FAILURES, 5)]
+        retry_after = max(retries, default=0)
+        if not retry_after:
+            for bucket in buckets:
+                bucket.failure_count += 1
+                bucket.save(update_fields=["failure_count", "updated_at"])
+        return retry_after
+
+
+def _release_auth_attempt(user_id, ip, scope):
+    """Remove this successful request without erasing previous failures."""
+    with transaction.atomic():
+        buckets = (AuthThrottleBucket.objects.select_for_update()
+                   .filter(key__in=_auth_throttle_keys(user_id, ip, scope)))
+        for bucket in buckets:
+            if bucket.failure_count:
+                bucket.failure_count -= 1
+                if not bucket.failure_count:
+                    bucket.window_started_at = None
+                bucket.save(update_fields=["failure_count", "window_started_at", "updated_at"])
+
+
+def _issue_challenge(user, purpose, lifetime_seconds):
+    """Issue a signed challenge whose database row enforces one-time use."""
+    now = timezone.now()
+    AuthChallenge.objects.filter(
+        Q(expires_at__lte=now) | Q(consumed_at__lte=now - timedelta(days=1))
+    ).delete()
+    token = signing.dumps({"user_id": user.pk, "purpose": purpose,
+                           "nonce": secrets.token_urlsafe(24),
+                           "auth_state": user.get_session_auth_hash()}, salt="user-otp-login")
+    AuthChallenge.objects.create(
+        token_sha256=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        user=user, purpose=purpose,
+        expires_at=now + timedelta(seconds=lifetime_seconds),
+    )
+    return token
+
+
+def _active_challenge(token, purpose, *, lock=False):
+    try:
+        payload = signing.loads(str(token or ""), salt="user-otp-login", max_age=600)
+    except (signing.BadSignature, signing.SignatureExpired):
+        return None, None
+    if payload.get("purpose") != purpose or not payload.get("nonce"):
+        return None, None
+    digest = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+    queryset = AuthChallenge.objects.select_related("user")
+    if lock:
+        queryset = queryset.select_for_update()
+    record = queryset.filter(
+        token_sha256=digest, purpose=purpose, consumed_at__isnull=True,
+        expires_at__gt=timezone.now(), user_id=payload.get("user_id"), user__is_active=True,
+    ).first()
+    if not record or not secrets.compare_digest(
+            str(payload.get("auth_state", "")), record.user.get_session_auth_hash()):
+        return None, None
+    return record.user, record
+
+
+def _consume_challenge(record):
+    record.consumed_at = timezone.now()
+    record.save(update_fields=["consumed_at"])
 
 
 @api_view(["GET"])
@@ -85,40 +171,27 @@ def login_view(request):
     username = str(request.data.get("username", "")).strip()
     password = request.data.get("password", "")
     ip = request.META.get("REMOTE_ADDR", "unknown")
-    key = _attempt_key(username, ip)
-    now = time.time()
-    stored_attempt = cache.get(key, 0)
-    if isinstance(stored_attempt, dict):
-        failures = int(stored_attempt.get("count", 0))
-        expires_at = float(stored_attempt.get("expires_at", now))
-    else:
-        failures = int(stored_attempt or 0)
-        expires_at = now + settings.LOGIN_WINDOW_SECONDS
-    if failures >= settings.LOGIN_MAX_FAILURES:
-        retry_after = max(1, int(expires_at - now))
+    throttle_identity = f"username:{username.casefold()}"
+    retry_after = _reserve_auth_attempt(throttle_identity, ip, "password-login")
+    if retry_after:
         return Response({"error": "Too many failed sign-in attempts. Wait for the cooldown to expire, then try again.",
                          "retry_after_seconds": retry_after}, status=429)
 
     user = authenticate(request, username=username, password=password)
     if user is None or not user.is_active:
-        if failures == 0:
-            expires_at = now + settings.LOGIN_WINDOW_SECONDS
-        failures += 1
-        cache.set(key, {"count": failures, "expires_at": expires_at},
-                  timeout=max(1, int(expires_at - now)))
         AuditEvent.objects.create(action="login_failed", entity_type="user", entity_id=username[:120])
         return Response({"error": "Invalid username or password."}, status=401)
+    _release_auth_attempt(throttle_identity, ip, "password-login")
     if not has_any_role(user, set(APPLICATION_ROLES) | {ADMIN_GROUP, VIEWER_GROUP}):
         AuditEvent.objects.create(actor=user, action="login_no_role", entity_type="user", entity_id=str(user.pk))
         return Response({"error": "This account has no application role."}, status=403)
-    cache.delete(key)
     device = AdminOTPDevice.objects.filter(user=user, enabled=True).first()
     if not device:
-        challenge = signing.dumps({"user_id": user.pk, "purpose": "enroll"}, salt="user-otp-login")
+        challenge = _issue_challenge(user, "enroll", 600)
         AuditEvent.objects.create(actor=user, action="otp_enrollment_required", entity_type="user",
                                   entity_id=str(user.pk))
         return Response({"otp_setup_required": True, "challenge": challenge, "expires_in": 600})
-    challenge = signing.dumps({"user_id": user.pk, "purpose": "login"}, salt="user-otp-login")
+    challenge = _issue_challenge(user, "login", 300)
     AuditEvent.objects.create(actor=user, action="otp_challenge_issued", entity_type="user",
                               entity_id=str(user.pk))
     return Response({"otp_required": True, "challenge": challenge, "expires_in": 300})
@@ -175,7 +248,7 @@ def admin_otp_setup(request):
 @transaction.atomic
 @never_cache
 def admin_otp_confirm(request):
-    user = _challenge_user(request.data.get("challenge"), "enroll")
+    user, challenge_record = _active_challenge(request.data.get("challenge"), "enroll", lock=True)
     if not user:
         return Response({"error": "This authenticator setup challenge expired. Sign in again.",
                          "code": "challenge_expired"}, status=401)
@@ -183,17 +256,15 @@ def admin_otp_confirm(request):
         return Response({"error": "This account has no application role."}, status=403)
     challenge = str(request.data.get("challenge", ""))
     ip = request.META.get("REMOTE_ADDR", "unknown")
-    attempt_key = "otp-enroll-fail:" + hashlib.sha256(
-        f"{challenge or user.pk}|{ip}".encode("utf-8")).hexdigest()
-    failures = cache.get(attempt_key, 0)
-    if failures >= min(settings.LOGIN_MAX_FAILURES, 5):
-        return Response({"error": "Too many invalid authenticator setup codes. Sign in again to retry."}, status=429)
+    retry_after = _reserve_auth_attempt(user.pk, ip, "otp-enroll")
+    if retry_after:
+        return Response({"error": "Too many invalid authenticator setup codes. Wait before retrying.",
+                         "retry_after_seconds": retry_after}, status=429)
     device = AdminOTPDevice.objects.select_for_update().filter(user=user, enabled=False).first()
     if not device:
         return Response({"error": "Start authenticator setup first."}, status=409)
     step = verify_code(decrypt_secret(device.secret), request.data.get("code"))
     if step is None:
-        cache.set(attempt_key, failures + 1, 300)
         AuditEvent.objects.create(actor=user, action="otp_verification_failed",
                                   entity_type="user", entity_id=str(user.pk))
         return Response({"error": "That code is invalid or expired. Try the latest code from your authenticator."}, status=400)
@@ -202,7 +273,8 @@ def admin_otp_confirm(request):
     device.last_used_step = step
     device.recovery_code_hashes = [make_password(code) for code in recovery_codes]
     device.save(update_fields=["enabled", "last_used_step", "recovery_code_hashes", "updated_at"])
-    cache.delete(attempt_key)
+    _consume_challenge(challenge_record)
+    _release_auth_attempt(user.pk, ip, "otp-enroll")
     AuditEvent.objects.create(actor=user, action="otp_enabled",
                               entity_type="user", entity_id=str(user.pk))
     response = {"enabled": True, "recovery_codes": recovery_codes}
@@ -223,13 +295,8 @@ def admin_otp_disable(request):
 
 
 def _challenge_user(challenge, purpose):
-    try:
-        payload = signing.loads(str(challenge or ""), salt="user-otp-login", max_age=600)
-    except (signing.BadSignature, signing.SignatureExpired):
-        return None
-    if payload.get("purpose") != purpose:
-        return None
-    return get_user_model().objects.filter(pk=payload.get("user_id"), is_active=True).first()
+    user, _record = _active_challenge(challenge, purpose)
+    return user
 
 
 @api_view(["POST"])
@@ -240,23 +307,27 @@ def _challenge_user(challenge, purpose):
 def complete_otp_login(request):
     challenge = str(request.data.get("challenge", ""))
     ip = request.META.get("REMOTE_ADDR", "unknown")
-    attempt_key = "otp-login-fail:" + hashlib.sha256(f"{challenge}|{ip}".encode("utf-8")).hexdigest()
-    failures = cache.get(attempt_key, 0)
-    if failures >= min(settings.LOGIN_MAX_FAILURES, 5):
-        return Response({"error": "Too many invalid OTP attempts. Sign in again to retry."}, status=429)
-    try:
-        payload = signing.loads(challenge, salt="user-otp-login", max_age=300)
-    except (signing.BadSignature, signing.SignatureExpired):
-        return Response({"error": "This sign-in challenge expired. Enter your password again.",
-                         "code": "challenge_expired"}, status=401)
-    if payload.get("purpose") != "login":
-        return Response({"error": "This sign-in challenge is invalid. Enter your password again.",
+    user, challenge_record = _active_challenge(challenge, "login")
+    if not user:
+        try:
+            signing.loads(challenge, salt="user-otp-login", max_age=300)
+        except (signing.BadSignature, signing.SignatureExpired):
+            return Response({"error": "This sign-in challenge expired. Enter your password again.",
+                             "code": "challenge_expired"}, status=401)
+        return Response({"error": "This sign-in challenge is invalid or already used. Enter your password again.",
                          "code": "challenge_invalid"}, status=401)
-    user = get_user_model().objects.filter(pk=payload.get("user_id"), is_active=True).first()
     if not user or not has_any_role(user, set(APPLICATION_ROLES) | {ADMIN_GROUP, VIEWER_GROUP}):
         return Response({"error": "This authenticator sign-in is no longer valid. Enter your password again.",
                          "code": "authentication_state_invalid"}, status=401)
+    retry_after = _reserve_auth_attempt(user.pk, ip, "otp-login")
+    if retry_after:
+        return Response({"error": "Too many invalid OTP attempts. Wait before retrying.",
+                         "retry_after_seconds": retry_after}, status=429)
     with transaction.atomic():
+        user, challenge_record = _active_challenge(challenge, "login", lock=True)
+        if not user:
+            return Response({"error": "This sign-in challenge is invalid or already used. Enter your password again.",
+                             "code": "challenge_invalid"}, status=401)
         device = AdminOTPDevice.objects.select_for_update().filter(user=user, enabled=True).first()
         if not device:
             return Response({"error": "This authenticator sign-in is no longer valid. Enter your password again.",
@@ -270,7 +341,6 @@ def complete_otp_login(request):
                     recovery_hash_index = i
                     break
         if (step is None and recovery_hash_index is None) or (step is not None and step <= device.last_used_step):
-            cache.set(attempt_key, failures + 1, 300)
             AuditEvent.objects.create(actor=user, action="otp_verification_failed", entity_type="user",
                                       entity_id=str(user.pk))
             return Response({"error": "That code is invalid, expired, or already used."}, status=401)
@@ -284,7 +354,8 @@ def complete_otp_login(request):
             device.last_used_step = step
             device.save(update_fields=["last_used_step", "updated_at"])
             auth_method = "totp"
-    cache.delete(attempt_key)
+        _consume_challenge(challenge_record)
+    _release_auth_attempt(user.pk, ip, "otp-login")
     login(request, user)
     mark_mfa_verified(request.session, user, device)
     AuditEvent.objects.create(actor=user, action="login_succeeded", entity_type="user",

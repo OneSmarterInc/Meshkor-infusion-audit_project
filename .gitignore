@@ -38,6 +38,8 @@ media/
 *.swo
 *~
 __pycache__/
+.pytest-tmp/
+*.pyc
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

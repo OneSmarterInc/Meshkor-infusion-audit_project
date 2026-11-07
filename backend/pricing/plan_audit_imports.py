@@ -290,7 +290,7 @@ def import_plan_summary(request):
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def plan_summary_imports(request):
     queryset = ClaimsSummaryImport.objects.select_related("organization", "plan").filter(
         organization__in=visible_organizations(request.user))
@@ -300,13 +300,13 @@ def plan_summary_imports(request):
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def plan_summary_import_detail(request, import_id):
     return Response(import_payload(get_visible_import(request.user, import_id)))
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def plan_summary_import_quality(request, import_id):
     item = get_visible_import(request.user, import_id)
     return Response({"import_id": item.pk, "file_hash": item.file_hash,
@@ -318,10 +318,12 @@ def plan_summary_import_quality(request, import_id):
 @permission_classes([CanView])
 def plan_audits(request):
     from .models import PlanAudit
-    from .plan_audit_common import audit_payload
+    from .plan_audit_common import audit_payload, is_client_only
     queryset = PlanAudit.objects.select_related(
         "organization", "plan", "summary_import", "created_by"
     ).filter(organization__in=visible_organizations(request.user))
+    if is_client_only(request.user):
+        queryset = queryset.filter(plan__status="active")
     if request.query_params.get("plan_id"):
         queryset = queryset.filter(plan_id=request.query_params["plan_id"])
     return Response([audit_payload(item, request.user) for item in queryset[:200]])
@@ -358,5 +360,10 @@ def create_plan_audit(request):
 @api_view(["GET"])
 @permission_classes([CanView])
 def plan_audit_detail(request, audit_id):
-    from .plan_audit_common import get_accessible_audit
-    return Response(audit_payload(get_accessible_audit(request.user, audit_id), request.user))
+    from .plan_audit_common import get_accessible_audit, is_client_only
+    from django.http import Http404
+    audit = get_accessible_audit(request.user, audit_id)
+    if is_client_only(request.user) and (
+            audit.organization.status != "active" or audit.plan.status != "active"):
+        raise Http404
+    return Response(audit_payload(audit, request.user))

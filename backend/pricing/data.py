@@ -8,6 +8,8 @@ from pathlib import Path
 import duckdb
 
 from pipeline.common import drugs_in_scope, paths, sha256
+from pipeline.artifacts import (LEGACY_REFERENCE_ARTIFACTS, MART_ARTIFACTS,
+    NORMALIZED_ARTIFACTS, REFERENCE_ARTIFACTS)
 
 PRICED = ("ok", "review_range")       # statuses that carry a markup multiple
 
@@ -19,29 +21,32 @@ def files() -> dict[str, Path]:
     p = paths()
     archive = p["mart"].parent / "processed_parquet_backup"
 
-    def stored(directory: Path, backup_group: str, name: str) -> Path:
-        active = directory / name
-        if active.is_file():
-            return active
-        return archive / backup_group / name
+    def stored(directory: Path, backup_group: str, name: str,
+               aliases: tuple[str, ...] = ()) -> Path:
+        for root in (directory, archive / backup_group):
+            for candidate in (name, *aliases):
+                path = root / candidate
+                if path.is_file():
+                    return path
+        return directory / name
 
     return {
-        "comparison": stored(p["mart"], "mart", "comparison.parquet"),
-        "run_info": stored(p["mart"], "mart", "run_info.json"),
-        "asp": stored(p["ref"], "ref", "ref_asp.parquet"),
-        "crosswalk": (
-            stored(p["ref"], "ref", "ref_crosswalk.parquet")
-            if (p["ref"] / "ref_crosswalk.parquet").is_file()
-            else stored(p["ref"], "ref", "ref_ndc_hcpcs.parquet")
-        ),
-        "ndc_products": stored(p["ref"], "ref", "ref_ndc_product.parquet"),
-        "ndc_packages": stored(p["ref"], "ref", "ref_ndc_package.parquet"),
-        "hospitals_ref": stored(p["ref"], "ref", "ref_hospitals.parquet"),
-        "nadac": stored(p["ref"], "ref", "ref_nadac.parquet"),
-        "providers": stored(p["ref"], "ref", "ref_providers.parquet"),
-        "enrollments": stored(p["ref"], "ref", "ref_enrollments.parquet"),
-        "scope": stored(p["ref"], "ref", "drug_scope.parquet"),
-        "quality": stored(p["hpt_norm"], "hpt/norm", "hpt_file_quality.parquet"),
+        "comparison": stored(p["mart"], "mart", MART_ARTIFACTS["comparison"]),
+        "run_info": stored(p["mart"], "mart", MART_ARTIFACTS["run_info"]),
+        "asp": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["asp"]),
+        "crosswalk": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["crosswalk"],
+                            LEGACY_REFERENCE_ARTIFACTS["crosswalk"]),
+        "ndc_products": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["ndc_products"],
+                               LEGACY_REFERENCE_ARTIFACTS["ndc_products"]),
+        "ndc_packages": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["ndc_packages"],
+                               LEGACY_REFERENCE_ARTIFACTS["ndc_packages"]),
+        "hospitals_ref": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["hospitals"]),
+        "nadac": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["nadac"]),
+        "providers": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["providers"]),
+        "enrollments": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["enrollments"],
+                               LEGACY_REFERENCE_ARTIFACTS["enrollments"]),
+        "scope": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["drug_scope"]),
+        "quality": stored(p["hpt_norm"], "hpt/norm", NORMALIZED_ARTIFACTS["hospital_quality"]),
     }
 
 
@@ -83,6 +88,14 @@ _QUERY_BIND_TOKEN = re.compile(r"__pricing_parquet_[A-Za-z0-9_]+__|\?")
 
 
 def query(sql: str, params: list | None = None, **tables: str) -> list[dict]:
+    """Read from one complete snapshot, coordinating with the atomic publish window."""
+    from pipeline.common import project_root
+    from pipeline.snapshots import snapshot_read_mutex
+    with snapshot_read_mutex(project_root()):
+        return _query_snapshot(sql, params, **tables)
+
+
+def _query_snapshot(sql: str, params: list | None = None, **tables: str) -> list[dict]:
     """Run SQL with parameter-bound Parquet scans; normalize legacy ASP columns."""
     if "comparison" in tables.values():
         require_current_scope()
@@ -216,6 +229,9 @@ def require_current_scope() -> str:
     comparison_path = files()["comparison"]
     if not comparison_path.is_file():
         raise DataMissing("comparison.parquet is missing from the active data folder and archive.")
+    expected_comparison_hash = info.get("comparison_sha256")
+    if expected_comparison_hash and sha256(comparison_path) != expected_comparison_hash:
+        raise DataMissing("The comparison artifact does not match its run metadata; restore or rebuild a complete snapshot.")
     con = duckdb.connect()
     try:
         comparison_rows = con.execute("SELECT count(*) FROM read_parquet(?)", [comparison_path.as_posix()]).fetchone()[0]

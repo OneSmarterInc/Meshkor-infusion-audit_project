@@ -17,8 +17,57 @@ const API_ENDPOINTS = Object.freeze({
   hospitalDrugPriceComparisonsCsv: "hospital-drug-price-comparisons/exports/csv/",
 });
 
+function httpErrorMessage(status, statusText, serverMessage) {
+  if (status >= 500) return "The service could not complete your request. Please try again.";
+  if (serverMessage) return serverMessage;
+  if (status === 401) return "Your session has expired. Sign in again to continue.";
+  if (status === 403) return "The request could not be verified. Refresh the page and try again.";
+  return `${status} ${statusText}`;
+}
+
 function csrfCookie() {
   return document.cookie.split(";").map((v) => v.trim()).find((v) => v.startsWith("csrftoken="))?.slice(10) || "";
+}
+
+function refreshAccess() {
+  if (!refreshPromise) {
+    refreshPromise = request(API_ENDPOINTS.refreshAccessToken, {
+      method: "POST", body: "{}",
+    }, { skipBearer: true, retryAuth: false })
+      .then((refreshed) => {
+        accessToken = refreshed.access;
+        if (!accessToken) throw new Error("The session refresh did not return an access token.");
+        return refreshed;
+      })
+      .catch((error) => {
+        accessToken = null;
+        window.dispatchEvent(new Event("meshkor:session-expired"));
+        throw error;
+      })
+      .finally(() => { refreshPromise = null; });
+  }
+  return refreshPromise;
+}
+
+async function fetchWithAuth(url, options = {}, retryAuth = true) {
+  const tokenUsed = accessToken;
+  const headers = { ...(options.headers || {}) };
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  const response = await fetch(url, { ...options, headers });
+  if (response.status !== 401 || !accessToken) return response;
+  if (!retryAuth) {
+    accessToken = null;
+    window.dispatchEvent(new Event("meshkor:session-expired"));
+    return response;
+  }
+  // A parallel request may already have refreshed the token while this 401 was in flight.
+  if (tokenUsed !== accessToken) return fetchWithAuth(url, options, false);
+  try {
+    await refreshAccess();
+    return fetchWithAuth(url, options, false);
+  } catch {
+    return response;
+  }
 }
 
 async function request(path, options = {}, { skipBearer = false, retryAuth = true } = {}) {
@@ -41,29 +90,14 @@ async function request(path, options = {}, { skipBearer = false, retryAuth = tru
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const error = new Error(body.error || `${res.status} ${res.statusText}`);
+    const error = new Error(httpErrorMessage(res.status, res.statusText, body.error));
     error.status = res.status;
     error.code = body.code;
     error.retryAfterSeconds = Number(body.retry_after_seconds) || 0;
     if (res.status === 401 && accessToken && cleanPath !== API_ENDPOINTS.refreshAccessToken) {
       if (retryAuth && canRefresh) {
         try {
-          if (!refreshPromise) {
-            refreshPromise = request(API_ENDPOINTS.refreshAccessToken, {
-              method: "POST", body: "{}",
-            }, { skipBearer: true, retryAuth: false })
-              .then((refreshed) => {
-                accessToken = refreshed.access;
-                return refreshed;
-              })
-              .catch((refreshError) => {
-                accessToken = null;
-                window.dispatchEvent(new Event("meshkor:session-expired"));
-                throw refreshError;
-              })
-              .finally(() => { refreshPromise = null; });
-          }
-          await refreshPromise;
+          await refreshAccess();
           return request(path, options, { retryAuth: false });
         } catch {
           throw error;
@@ -139,13 +173,12 @@ export async function uploadSource(sourceKey, file, metadata = {}) {
   if (metadata.system) form.append("system", metadata.system);
   if (metadata.snapshotDate) form.append("snapshot_date", metadata.snapshotDate);
   const headers = { "X-CSRFToken": csrfCookie() };
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-  const response = await fetch(`${API_ROOT}/${API_ENDPOINTS.sourceUpload}`, {
+  const response = await fetchWithAuth(`${API_ROOT}/${API_ENDPOINTS.sourceUpload}`, {
     method: "POST", body: form, credentials: "same-origin",
     headers,
   });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || `${response.status} ${response.statusText}`);
+  if (!response.ok) throw new Error(httpErrorMessage(response.status, response.statusText, body.error));
   return body;
 }
 
@@ -158,10 +191,8 @@ export function csvUrl(params) {
 }
 
 export async function downloadFile(path, filename) {
-  const headers = {};
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-  const res = await fetch(`${API_ROOT}/${path}`, { headers, credentials: "same-origin" });
-  if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
+  const res = await fetchWithAuth(`${API_ROOT}/${path}`, { credentials: "same-origin" });
+  if (!res.ok) throw new Error(httpErrorMessage(res.status, res.statusText, "The download could not be completed."));
   const blob = await res.blob();
   const url = window.URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -229,13 +260,12 @@ async function uploadForm(path, form) {
   await request(API_ENDPOINTS.csrfToken);
   const cleanPath = path.split("/").filter(Boolean).join("/");
   const headers = { "X-CSRFToken": csrfCookie() };
-  if (accessToken) headers.Authorization = "Bearer " + accessToken;
-  const response = await fetch(API_ROOT + "/" + cleanPath + "/", {
+  const response = await fetchWithAuth(API_ROOT + "/" + cleanPath + "/", {
     method: "POST", body: form, credentials: "same-origin", headers,
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const error = new Error(body.error || response.status + " " + response.statusText);
+    const error = new Error(httpErrorMessage(response.status, response.statusText, body.error));
     error.payload = body;
     throw error;
   }

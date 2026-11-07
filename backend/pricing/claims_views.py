@@ -22,7 +22,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
 from .models import AuditEvent, ClaimsExplorerDataset
-from .permissions import CanView
+from .permissions import CanAnalyze
 from .plan_audit_common import is_admin, visible_organizations
 
 logger = logging.getLogger(__name__)
@@ -251,7 +251,7 @@ def _registered_dataset(organization, identifier):
 
 
 @api_view(["GET", "POST"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def claims_datasets(request):
     """List or explicitly register allowlisted claims datasets for one organization."""
     organization, error = _resolve_authorized_organization(request)
@@ -308,7 +308,7 @@ def claims_datasets(request):
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def claims_synthea_summary(request):
     """Return analytical overview, summary KPIs, quality audit, and data boundaries for Synthea."""
     org, error = _resolve_authorized_organization(request)
@@ -363,7 +363,7 @@ def claims_synthea_summary(request):
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def claims_list(request):
     """Paginated, filterable list of claims/records from Parquet files."""
     org, error = _resolve_authorized_organization(request)
@@ -623,7 +623,7 @@ def claims_list(request):
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def claims_detail(request, claim_id: str):
     """Return allowlisted header and line detail within an authorized dataset."""
     org, error = _resolve_authorized_organization(request)

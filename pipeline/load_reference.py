@@ -10,6 +10,7 @@ import polars as pl
 import yaml
 
 from .common import load_yaml, paths, rel, sha256, write_sha256_sidecar
+from .artifacts import REFERENCE_ARTIFACTS
 
 
 def _latest(pattern: str) -> Path | None:
@@ -86,8 +87,8 @@ def load_fda_ndc() -> bool:
                               "dosage_form", "route", "active_strength", "active_ingredient_unit",
                               "labeler", "substance"), on="product_id", how="left")
     out = paths()["ref"]
-    n_products = _write_atomic(product_ref, out / "ref_ndc_products.parquet")
-    n_packages = _write_atomic(package_ref, out / "ref_ndc_packages.parquet")
+    n_products = _write_atomic(product_ref, out / REFERENCE_ARTIFACTS["ndc_products"])
+    n_packages = _write_atomic(package_ref, out / REFERENCE_ARTIFACTS["ndc_packages"])
     print(f"FDA NDC: {n_products:,} product rows and {n_packages:,} package rows; "
           f"source hashes {product_digest[:12]} / {package_digest[:12]}")
     return True
@@ -97,7 +98,7 @@ def load_nadac() -> bool:
     """Load actual CMS NADAC snapshots while retaining file/date lineage."""
     candidates = sorted(p for p in paths()["raw"].glob("nadac/**/*.csv")
                         if p.is_file() and not p.name.endswith(".part"))
-    target = paths()["ref"] / "ref_nadac.parquet"
+    target = paths()["ref"] / REFERENCE_ARTIFACTS["nadac"]
     known_hashes = set()
     if target.is_file():
         known_hashes = set(pl.read_parquet(target, columns=["source_sha256"])
@@ -216,7 +217,7 @@ def load_nppes() -> bool:
         pl.lit(None, dtype=pl.Date).alias("effective_start"),
         pl.lit(rel(source)).alias("source_file"), pl.lit(source_hash).alias("source_sha256"),
     )
-    count = _write_atomic(frame, paths()["ref"] / "ref_providers.parquet")
+    count = _write_atomic(frame, paths()["ref"] / REFERENCE_ARTIFACTS["providers"])
     print(f"NPPES: {count:,} {state_code} Type 2 providers in configured hospital taxonomies; source SHA-256 {source_hash}")
     return True
 
@@ -255,7 +256,7 @@ def load_hospital_enrollments() -> bool:
         pl.lit(None, dtype=pl.Date).alias("effective_start"), pl.lit(None, dtype=pl.Date).alias("effective_end"),
         pl.lit(rel(source)).alias("source_file"), pl.lit(source_hash).alias("source_sha256"),
     ).unique(subset=["ccn", "npi"], maintain_order=True)
-    count = _write_atomic(frame, paths()["ref"] / "ref_enrollments.parquet")
+    count = _write_atomic(frame, paths()["ref"] / REFERENCE_ARTIFACTS["enrollments"])
     print(f"CMS hospital enrollments: {count:,} Ohio acute-care CCN/NPI records; "
           f"source SHA-256 {source_hash}")
     return True
@@ -311,8 +312,8 @@ def load_hospital_catalog() -> bool:
         pl.lit(None, dtype=pl.String).alias("npi"),
         pl.lit(rel(source)).alias("source_file"), pl.lit(source_hash).alias("source_sha256"),
     )
-    enrollment_path = paths()["ref"] / "ref_enrollments.parquet"
-    provider_path = paths()["ref"] / "ref_providers.parquet"
+    enrollment_path = paths()["ref"] / REFERENCE_ARTIFACTS["enrollments"]
+    provider_path = paths()["ref"] / REFERENCE_ARTIFACTS["providers"]
     if enrollment_path.is_file():
         enrollment = (pl.scan_parquet(enrollment_path).group_by("ccn").agg(pl.col("npi").first()))
         frame = frame.join(enrollment, on="ccn", how="left", suffix="_enrollment")
@@ -326,8 +327,9 @@ def load_hospital_catalog() -> bool:
     if "provider_registry_name" not in frame.collect_schema().names():
         frame = frame.with_columns(pl.lit(None, dtype=pl.String).alias("provider_registry_name"),
                                    pl.lit(None, dtype=pl.String).alias("provider_taxonomy"))
-    count = _write_atomic(frame, paths()["ref"] / "ref_hospitals.parquet")
-    matched = pl.scan_parquet(paths()["ref"] / "ref_hospitals.parquet").filter(pl.col("npi").is_not_null()).select(pl.len()).collect().item()
+    hospital_path = paths()["ref"] / REFERENCE_ARTIFACTS["hospitals"]
+    count = _write_atomic(frame, hospital_path)
+    matched = pl.scan_parquet(hospital_path).filter(pl.col("npi").is_not_null()).select(pl.len()).collect().item()
     print(f"CMS hospital catalog: {count:,} {taxonomy['state_code']} acute-care hospitals; "
           f"{matched:,} matched to enrollment NPI; SHA-256 {source_hash}")
     return True

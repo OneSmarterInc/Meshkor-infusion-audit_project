@@ -259,9 +259,241 @@ def test_four_role_backend_permission_matrix():
     client_user = User.objects.create_user(username="scoped-client", password="client-test-password")
     client_user.groups.add(Group.objects.get(name="CLIENT"))
     client_plan_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/plan-audits/")
-    client_public_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/hospitals/")
+    client_market_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/hospitals/")
+    client_claims_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/claims/")
+    client_imports_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/plan-audits/imports/")
+    client_org_users_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/organizations/1/users/")
+    client_published_results_request = SimpleNamespace(
+        user=client_user, method="GET", path="/api/v1/plan-audits/1/results/")
     assert CanView().has_permission(client_plan_request, None)
-    assert not CanView().has_permission(client_public_request, None)
+    assert CanView().has_permission(client_market_request, None)
+    assert not CanView().has_permission(client_claims_request, None)
+    assert not CanView().has_permission(client_imports_request, None)
+    assert not CanView().has_permission(client_org_users_request, None)
+    assert CanView().has_permission(client_published_results_request, None)
+
+
+@pytest.mark.django_db
+def test_mk26_platform_writes_and_mk29_reviewer_import_inventory_are_denied(client, monkeypatch):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    from pricing.permissions import APPLICATION_ROLES
+    from pricing import plan_audit_imports, views
+
+    factory = APIRequestFactory()
+    monkeypatch.setattr(views, "_start_processing_worker", lambda job: False)
+    for role in APPLICATION_ROLES:
+        user = get_user_model().objects.create_user(
+            username=f"mk26-{role.lower()}", password="test-only-password")
+        user.groups.add(Group.objects.get_or_create(name=role)[0])
+        request = factory.post("/api/v1/data-sources/processing-jobs/",
+                               {"job_type": "refresh_data"}, format="json")
+        force_authenticate(request, user=user)
+        response = views.processing_jobs(request)
+        assert response.status_code == (503 if role == "SUPER_ADMIN" else 403)
+
+        upload = factory.post("/api/v1/data-sources/upload/", {}, format="multipart")
+        force_authenticate(upload, user=user)
+        assert views.source_upload(upload).status_code == (400 if role == "SUPER_ADMIN" else 403)
+
+        imports = factory.get("/api/v1/plan-audits/imports/")
+        force_authenticate(imports, user=user)
+        result = plan_audit_imports.plan_summary_imports(imports)
+        assert result.status_code == (200 if role in {"SUPER_ADMIN", "ANALYST"} else 403)
+
+
+@pytest.mark.django_db
+def test_import_inventory_and_audit_creation_use_accepted_tenant_scoped_imports(client):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    from pricing.models import (ClaimsSummaryImport, Plan, PlanAudit,
+                                PlanOrganization, PlanOrganizationAccess)
+    from pricing import plan_audit_imports
+
+    User = get_user_model()
+    admin = User.objects.get(username="audit-test-admin")
+    analyst = User.objects.create_user(username="mk30-import-analyst", password="test-password")
+    analyst.groups.add(Group.objects.get_or_create(name="ANALYST")[0])
+    reviewer = User.objects.create_user(username="mk30-import-reviewer", password="test-password")
+    reviewer.groups.add(Group.objects.get_or_create(name="REVIEWER")[0])
+    client_user = User.objects.create_user(username="mk30-import-client", password="test-password")
+    client_user.groups.add(Group.objects.get_or_create(name="CLIENT")[0])
+
+    organization = PlanOrganization.objects.create(
+        organization_name="MK30 Assigned Import Org", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Assigned plan",
+                               plan_reference="MK30-ASSIGNED")
+    foreign_org = PlanOrganization.objects.create(
+        organization_name="MK30 Foreign Import Org", organization_type="employer")
+    foreign_plan = Plan.objects.create(organization=foreign_org, plan_name="Foreign plan",
+                                       plan_reference="MK30-FOREIGN")
+    PlanOrganizationAccess.objects.create(organization=organization, user=analyst, granted_by=admin)
+
+    accepted = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="accepted-synthetic.csv",
+        file_hash="a" * 64, schema_version="test-v1", import_status="accepted",
+        source_period="2026Q4")
+    rejected = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="rejected-synthetic.csv",
+        file_hash="b" * 64, schema_version="test-v1", import_status="rejected")
+    foreign = ClaimsSummaryImport.objects.create(
+        organization=foreign_org, plan=foreign_plan, source_file_name="foreign-synthetic.csv",
+        file_hash="c" * 64, schema_version="test-v1", import_status="accepted")
+
+    factory = APIRequestFactory()
+
+    admin_list = client.get(f"/api/v1/plan-audits/imports/?plan_id={plan.pk}")
+    assert admin_list.status_code == 200
+    assert {item["id"] for item in admin_list.json()} == {accepted.pk, rejected.pk}
+
+    def call(user, method, view, path, data=None, **kwargs):
+        request = (factory.get(path) if method == "GET" else
+                   factory.post(path, data, format="json"))
+        force_authenticate(request, user=user)
+        return view(request, **kwargs)
+
+    analyst_list = call(analyst, "GET", plan_audit_imports.plan_summary_imports,
+                        "/api/v1/plan-audits/imports/")
+    assert analyst_list.status_code == 200
+    assert {item["id"] for item in analyst_list.data} == {accepted.pk, rejected.pk}
+    assert foreign.pk not in {item["id"] for item in analyst_list.data}
+    assert call(reviewer, "GET", plan_audit_imports.plan_summary_imports,
+                "/api/v1/plan-audits/imports/").status_code == 403
+    assert call(client_user, "GET", plan_audit_imports.plan_summary_imports,
+                "/api/v1/plan-audits/imports/").status_code == 403
+
+    from pricing.plan_audit_imports import create_plan_audit
+    accepted_response = call(analyst, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {
+        "organization_id": organization.pk, "plan_id": plan.pk,
+        "summary_import_id": accepted.pk, "audit_name": "Accepted synthetic audit",
+    })
+    assert accepted_response.status_code == 201, accepted_response.data
+    created = PlanAudit.objects.get(pk=accepted_response.data["id"])
+    assert created.summary_import_id == accepted.pk
+
+    for bad_import in (rejected, foreign):
+        response = call(analyst, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {
+            "organization_id": organization.pk, "plan_id": plan.pk,
+            "summary_import_id": bad_import.pk, "audit_name": "Invalid synthetic audit",
+        })
+        assert response.status_code == 400
+
+    assert call(reviewer, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {}).status_code == 403
+    assert call(client_user, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {}).status_code == 403
+
+
+@pytest.mark.django_db
+def test_mk25_paginated_serializers_check_client_visibility_once(client, monkeypatch):
+    from types import SimpleNamespace
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    from pricing.permissions import APPLICATION_ROLES
+    from pricing import plan_audit_run
+
+    class Rows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def exclude(self, **kwargs):
+            return self
+
+        def order_by(self, *fields):
+            return self
+
+        def count(self):
+            return len(self.rows)
+
+        def __getitem__(self, item):
+            return self.rows[item]
+
+    factory = APIRequestFactory()
+    audit = SimpleNamespace(pk=1)
+    monkeypatch.setattr(plan_audit_run, "get_visible_audit", lambda user, audit_id: audit)
+    monkeypatch.setattr(plan_audit_run, "current_audit_run", lambda _audit: object())
+    monkeypatch.setattr(plan_audit_run, "run_results", lambda _run: active_rows[0])
+
+    for role in APPLICATION_ROLES:
+        user = get_user_model().objects.create_user(
+            username=f"mk25-{role.lower()}", password="test-only-password")
+        user.groups.add(Group.objects.get_or_create(name=role)[0])
+        client_only = role == "CLIENT"
+        checks = []
+        monkeypatch.setattr(plan_audit_run, "is_client_only",
+                            lambda _user, value=client_only: checks.append(value) or value)
+        for endpoint, route_name, values in (
+            (plan_audit_run.hospital_comparison, "hospital-comparison", {
+                "hospital_price_per_unit": "12", "hospital_markup_multiple": "2",
+                "plan_to_hospital_price_multiple": "1.5",
+            }),
+            (plan_audit_run.asp_benchmark, "asp-benchmark", {
+                "asp_payment_limit": "6", "allowed_markup_multiple": "2",
+                "paid_markup_multiple": "1.5",
+            }),
+        ):
+            query_counts = []
+            for size in (1, 50):
+                checks.clear()
+                row = SimpleNamespace(
+                    hcpcs_code="J1234", site_npi="1000000001", quarter="2026Q1",
+                    service_setting="outpatient", plan_allowed_price_per_unit="12",
+                    plan_paid_price_per_unit="9", data_quality_status="VALID",
+                    source_references={"private": "synthetic"}, **values)
+                active_rows = [Rows([row] * size)]
+                request = factory.get(f"/api/v1/plan-audits/1/{route_name}/")
+                force_authenticate(request, user=user)
+                with CaptureQueriesContext(connection) as queries:
+                    response = endpoint(request, audit_id=1)
+                query_counts.append(len(queries))
+                assert response.status_code == 200, (role, endpoint.__name__, response.data)
+                assert len(checks) == 1
+                result = response.data["results"][0]
+                assert ("source_references" in result) is (not client_only)
+            assert query_counts[0] == query_counts[1]
+
+
+@pytest.mark.django_db
+def test_mk28_client_market_exports_are_limited_to_released_canonical_csv(client, monkeypatch):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from rest_framework.test import APIRequestFactory
+    from pricing.permissions import APPLICATION_ROLES, CanAdminister
+    from pricing import views
+
+    release = {"drug_codes": ["J1234"]}
+    monkeypatch.setattr(views, "_comparison_column_names", lambda: set(views.RATE_COLUMNS))
+    factory = APIRequestFactory()
+
+    for role in APPLICATION_ROLES:
+        user = get_user_model().objects.create_user(
+            username=f"mk28-{role.lower()}", password="test-only-password")
+        user.groups.add(Group.objects.get_or_create(name=role)[0])
+        monkeypatch.setattr(views, "_viewer_release_payload",
+                            lambda _request, client=(role == "CLIENT"):
+                            (release, None) if client else (None, None))
+
+        def authorized(path):
+            request = factory.get(path)
+            request.user = user
+            return views._authorized_rate_filters(request)[3]
+
+        legacy = authorized("/api/v1/comparisons.csv")
+        modern = authorized("/api/v1/hospital-drug-price-comparisons/exports/csv/")
+        if role == "CLIENT":
+            assert legacy.status_code == 403
+            assert isinstance(modern, list)
+            assert not {"source_file", "source_member", "source_sha256"}.intersection(modern)
+        else:
+            assert isinstance(legacy, list)
+            assert isinstance(modern, list)
+
+        xlsx_request = factory.get("/api/v1/hospital-drug-price-comparisons/exports/excel/")
+        xlsx_request.user = user
+        assert CanAdminister().has_permission(xlsx_request, None) is (role == "SUPER_ADMIN")
 
 
 @pytest.mark.django_db
@@ -509,6 +741,7 @@ def test_rates_filter_and_sort(client):
 
 def test_production_comparison_parquet_supports_rate_projection(monkeypatch):
     """Guard the real snapshot against DuckDB projected-column reader regressions."""
+    from decimal import Decimal
     from pricing import data
 
     comparison = BACKEND.parent / "data" / "mart" / "comparison.parquet"
@@ -516,13 +749,18 @@ def test_production_comparison_parquet_supports_rate_projection(monkeypatch):
     monkeypatch.setattr(data, "require_current_scope", lambda: "verified_source")
 
     rows = data.query(
-        "SELECT hospital_key, price, asp_payment_limit, markup_multiple FROM {cmp} "
+        "SELECT hospital_key, price_per_billing_unit, asp_payment_limit, markup_multiple FROM {cmp} "
         "ORDER BY markup_multiple DESC NULLS LAST LIMIT 50 OFFSET 0",
         cmp="comparison",
     )
     assert len(rows) == 50
-    assert str(rows[0]["markup_multiple"]) == "0.33013196677384780278670953910"
-    assert str(rows[-1]["markup_multiple"]) == "0.11088290460878885316184351550"
+    priced = [row for row in rows if row["markup_multiple"] is not None]
+    assert priced
+    multiples = [Decimal(str(row["markup_multiple"])) for row in priced]
+    assert multiples == sorted(multiples, reverse=True)
+    for row in priced:
+        calculated = Decimal(str(row["price_per_billing_unit"])) / Decimal(str(row["asp_payment_limit"]))
+        assert abs(calculated - Decimal(str(row["markup_multiple"]))) < Decimal("1e-18")
 
 
 def test_comparison_payer_filter_options_come_from_parquet(client):
@@ -646,6 +884,8 @@ def test_viewer_cannot_read_source_inventory_or_job_logs(built, db):
 
 
 def test_refresh_job_starts_worker_automatically(client, monkeypatch):
+    from contextlib import contextmanager
+    import pipeline.snapshots
     import pricing.views
 
     calls = []
@@ -655,6 +895,101 @@ def test_refresh_job_starts_worker_automatically(client, monkeypatch):
     assert response.status_code == 202, response.json()
     assert response.json()["status"] == "queued"
     assert calls and calls[0][0][0][2:] == ["process_jobs", "--once"]
+    @contextmanager
+    def active_worker_lock(_project, *, blocking=True):
+        yield False
+
+    monkeypatch.setattr(pipeline.snapshots, "pipeline_mutex", active_worker_lock)
+    duplicate = client.post("/api/v1/sources/jobs/", {"job_type": "market_report"},
+                            content_type="application/json")
+    assert duplicate.status_code == 409
+    assert len(calls) == 1
+
+
+def test_stale_processing_job_restarts_only_when_pipeline_lock_is_free(client, monkeypatch):
+    from contextlib import contextmanager
+    import pipeline.snapshots
+    import pricing.views
+    from django.utils import timezone
+    from pricing.models import ProcessingJob
+
+    job = ProcessingJob.objects.create(job_type="refresh_data", status="running",
+                                       started_at=timezone.now())
+    calls = []
+    monkeypatch.setattr(pricing.views.subprocess, "Popen",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    state = {"available": False}
+
+    @contextmanager
+    def fake_pipeline_mutex(_project, *, blocking=True):
+        assert blocking is False
+        yield state["available"]
+
+    monkeypatch.setattr(pipeline.snapshots, "pipeline_mutex", fake_pipeline_mutex)
+    path = "/api/v1/sources/jobs/"
+    payload = {"job_type": "refresh_data"}
+    busy = client.post(path, payload, content_type="application/json")
+    assert busy.status_code == 409
+    assert busy.json()["id"] == job.pk
+    assert calls == []
+
+    state["available"] = True
+    recovered = client.post(path, payload, content_type="application/json")
+    assert recovered.status_code == 202
+    assert recovered.json()["id"] == job.pk
+    assert recovered.json()["recovery_scheduled"] is True
+    assert len(calls) == 1
+    assert ProcessingJob.objects.count() == 1
+
+
+def test_plan_audit_hospital_and_asp_lists_are_paged(client, monkeypatch):
+    from decimal import Decimal
+    from types import SimpleNamespace
+    import pricing.plan_audit_run as audit_run
+
+    rows = [SimpleNamespace(
+        hcpcs_code="J9271", site_npi=f"{index:010d}", quarter="2026Q1",
+        service_setting="outpatient", plan_allowed_price_per_unit=Decimal("100"),
+        hospital_price_per_unit=Decimal("125"), hospital_markup_multiple=Decimal("1.25"),
+        plan_to_hospital_price_multiple=Decimal("0.8"), data_quality_status="VALID",
+        source_references={}, plan_paid_price_per_unit=Decimal("90"),
+        asp_payment_limit=Decimal("80"), allowed_markup_multiple=Decimal("1.25"),
+        paid_markup_multiple=Decimal("1.125"),
+    ) for index in range(2005)]
+
+    class QueryRows:
+        def __init__(self, items):
+            self.items = items
+
+        def exclude(self, **_kwargs):
+            return self
+
+        def order_by(self, *_fields):
+            return self
+
+        def count(self):
+            return len(self.items)
+
+        def __getitem__(self, selection):
+            return self.items[selection]
+
+    monkeypatch.setattr(audit_run, "get_visible_audit", lambda *_args: object())
+    monkeypatch.setattr(audit_run, "current_audit_run", lambda *_args: object())
+    monkeypatch.setattr(audit_run, "run_results", lambda *_args: QueryRows(rows))
+
+    for endpoint in ("hospital-comparison", "asp-benchmark"):
+        first_page = client.get(f"/api/v1/plan-audits/1/{endpoint}/?limit=200&offset=0")
+        assert first_page.status_code == 200
+        assert first_page.json()["count"] == 2005
+        assert len(first_page.json()["results"]) == 200
+        assert first_page.json()["next_offset"] == 200
+        assert first_page.json()["previous_offset"] is None
+
+        last_page = client.get(f"/api/v1/plan-audits/1/{endpoint}/?limit=200&offset=2000")
+        assert last_page.status_code == 200
+        assert len(last_page.json()["results"]) == 5
+        assert last_page.json()["next_offset"] is None
+        assert last_page.json()["previous_offset"] == 1800
 
 
 def test_saved_comparison_is_available_as_archived_snapshot_when_source_is_missing(built):
@@ -849,6 +1184,82 @@ def test_organization_and_plan_lifecycle(client):
     assert any(p["id"] == plan_id for p in plans_list.json())
 
 
+@pytest.mark.django_db
+def test_admin_account_role_and_organization_access_workflow(client):
+    """Exercise the Admin UI's account and tenant-access API contracts together."""
+    from django.contrib.auth import get_user_model
+    from django.test import Client as DjangoClient
+
+    password = "Meshkor-Test-Account-2026!"
+    created_accounts = {}
+    for role in ("ANALYST", "REVIEWER", "CLIENT"):
+        response = client.post("/api/v1/user-accounts/", {
+            "username": f"phase2-{role.lower()}", "role": role, "password": password,
+        }, content_type="application/json")
+        assert response.status_code == 201, response.content
+        created_accounts[role] = response.json()["id"]
+
+    listed = client.get("/api/v1/user-accounts/")
+    assert listed.status_code == 200
+    for role, user_id in created_accounts.items():
+        account = next(item for item in listed.json() if item["id"] == user_id)
+        assert account["roles"] == [role]
+        assert account["is_active"] is True
+
+    # A role change and deactivation are persisted by the same endpoint the UI calls.
+    role_update = client.post(f"/api/v1/user-accounts/{created_accounts['ANALYST']}/management/", {
+        "role": "ANALYST", "is_active": True,
+    }, content_type="application/json")
+    assert role_update.status_code == 200
+    assert role_update.json()["roles"] == ["ANALYST"]
+    disable = client.post(f"/api/v1/user-accounts/{created_accounts['CLIENT']}/management/", {
+        "role": "CLIENT", "is_active": False,
+    }, content_type="application/json")
+    assert disable.status_code == 200
+    assert disable.json()["is_active"] is False
+    client_user = get_user_model().objects.get(pk=created_accounts["CLIENT"])
+    assert client_user.is_active is False
+
+    organization = client.post("/api/v1/organizations/", {
+        "organization_name": "Phase 2 Workflow Test Employer", "organization_type": "employer",
+    }, content_type="application/json")
+    assert organization.status_code == 201, organization.content
+    organization_id = organization.json()["id"]
+    plan = client.post("/api/v1/plans/", {
+        "organization_id": organization_id, "plan_name": "Synthetic Test Plan",
+        "plan_reference": "PHASE2-WORKFLOW-TEST", "effective_start": "2026-01-01",
+    }, content_type="application/json")
+    assert plan.status_code == 201, plan.content
+
+    for role, user_id in created_accounts.items():
+        grant = client.post(f"/api/v1/organizations/{organization_id}/users/", {"user_id": user_id},
+                            content_type="application/json")
+        assert grant.status_code == (400 if role == "CLIENT" else 201), grant.content
+        if role != "CLIENT":
+            user = get_user_model().objects.get(pk=user_id)
+            role_client = mfa_force_login(DjangoClient(), user)
+            assert any(item["id"] == organization_id
+                       for item in role_client.get("/api/v1/organizations/").json())
+            assert any(item["id"] == plan.json()["id"]
+                       for item in role_client.get("/api/v1/plans/", {"organization_id": organization_id}).json())
+
+    # Re-enable the Client through the Admin action, grant access, then revoke it.
+    enable = client.post(f"/api/v1/user-accounts/{created_accounts['CLIENT']}/management/", {
+        "role": "CLIENT", "is_active": True,
+    }, content_type="application/json")
+    assert enable.status_code == 200
+    assert client.post(f"/api/v1/organizations/{organization_id}/users/",
+                       {"user_id": created_accounts["CLIENT"]}, content_type="application/json").status_code == 201
+    client_account = get_user_model().objects.get(pk=created_accounts["CLIENT"])
+    role_client = mfa_force_login(DjangoClient(), client_account)
+    assert any(item["id"] == organization_id for item in role_client.get("/api/v1/organizations/").json())
+    revoke = client.delete(
+        f"/api/v1/organizations/{organization_id}/users/{created_accounts['CLIENT']}/")
+    assert revoke.status_code == 204
+    assert role_client.get("/api/v1/organizations/").json() == []
+    assert role_client.get("/api/v1/plans/", {"organization_id": organization_id}).json() == []
+
+
 def test_claims_explorer_organization_scoping_and_privacy(client, db):
     from django.contrib.auth import get_user_model
     from django.contrib.auth.models import Group
@@ -879,6 +1290,17 @@ def test_claims_explorer_organization_scoping_and_privacy(client, db):
         "dataset_identifier": "desynpuf_inpatient_claims_sample_1",
     }, content_type="application/json")
     assert unauthorized_registration.status_code == 403
+
+    reviewer_group, _ = Group.objects.get_or_create(name="REVIEWER")
+    reviewer_user = get_user_model().objects.create_user(username="claims-reviewer", password="test-password")
+    reviewer_user.groups.add(reviewer_group)
+    PlanOrganizationAccess.objects.create(organization=org1, user=reviewer_user)
+    reviewer_client = DjangoClient()
+    mfa_force_login(reviewer_client, reviewer_user)
+    assert reviewer_client.get("/api/v1/claims/datasets/", {"organization_id": org1.pk}).status_code == 403
+    assert reviewer_client.get("/api/v1/claims/", {
+        "organization_id": org1.pk, "dataset": "desynpuf_outpatient_claims_sample_1",
+    }).status_code == 403
 
     dataset_id = "desynpuf_outpatient_claims_sample_1"
     ClaimsExplorerDataset.objects.create(
@@ -997,8 +1419,17 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
 
     # 2. Setup Reviewer user with organization access
     rev_group, _ = Group.objects.get_or_create(name="REVIEWER")
-    rev_user = get_user_model().objects.create_user(username="e2e-reviewer", password="test-password")
-    rev_user.groups.add(rev_group)
+    client_group, _ = Group.objects.get_or_create(name="CLIENT")
+    analyst_group, _ = Group.objects.get_or_create(name="ANALYST")
+
+    def create_role_account(username, role):
+        response = client.post("/api/v1/user-accounts/", {
+            "username": username, "role": role, "password": "Meshkor-Test-Account-2026!",
+        }, content_type="application/json")
+        assert response.status_code == 201, response.content
+        return get_user_model().objects.get(pk=response.json()["id"])
+
+    rev_user = create_role_account("e2e-reviewer", "REVIEWER")
     grant_res = client.post(f"/api/v1/organizations/{org_id}/users/", {"user_id": rev_user.pk}, content_type="application/json")
     assert grant_res.status_code == 201, grant_res.content
     assert grant_res.json()["created"] is True
@@ -1023,18 +1454,14 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     rev_b_client = DjangoClient()
     mfa_force_login(rev_b_client, rev_b_user)
 
-    client_group, _ = Group.objects.get_or_create(name="CLIENT")
-    client_user = get_user_model().objects.create_user(username="e2e-client-user", password="test-password")
-    client_user.groups.add(client_group)
+    client_user = create_role_account("e2e-client-user", "CLIENT")
     assert client.post(f"/api/v1/organizations/{org_id}/users/", {"user_id": client_user.pk},
                        content_type="application/json").status_code in {200, 201}
     client_test_client = DjangoClient()
     mfa_force_login(client_test_client, client_user)
     assert client_test_client.post(f"/api/v1/organizations/{org_id}/users/",
                                    {"user_id": rev_user.pk}, content_type="application/json").status_code == 403
-    analyst_group, _ = Group.objects.get_or_create(name="ANALYST")
-    analyst_user = get_user_model().objects.create_user(username="mk06-analyst", password="test-password")
-    analyst_user.groups.add(analyst_group)
+    analyst_user = create_role_account("mk06-analyst", "ANALYST")
     analyst_client = DjangoClient()
     mfa_force_login(analyst_client, analyst_user)
     assert analyst_client.post(f"/api/v1/organizations/{org_id}/users/",
@@ -1268,7 +1695,7 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     assert result["source_references"]["unit_review_status"] == "unresolved"
     assert Decimal(result["plan_allowed_price_per_unit"]) == Decimal("150")
     assert Decimal(result["plan_paid_price_per_unit"]) == Decimal("120")
-    assert client.get(f"/api/v1/plan-audits/{audit_id}/savings/").json() == []
+    assert client.get(f"/api/v1/plan-audits/{audit_id}/savings/").json()["results"] == []
 
     # The actual unresolved engine output must not be publishable.
     from pricing.models import (AuditEvent, AuditReview, PlanAudit, PlanAuditResult,
@@ -1283,6 +1710,14 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
         {"comments": "Unresolved fixture must not publish.", **unresolved_binding},
         content_type="application/json")
     assert unresolved_approval.status_code == 409
+    assert unresolved_approval.json()["error"] == "Resolve blocking data quality issues before publication."
+    audit_obj.refresh_from_db()
+    run_obj.refresh_from_db()
+    assert run_obj.calculation_status == "completed"
+    assert run_obj.publication_status == "pending"
+    assert audit_obj.published_version is None
+    assert not AuditReview.objects.filter(audit_run=run_obj, review_status="approved").exists()
+    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/results/").status_code == 404
 
     # Legacy rows without current creator/run provenance cannot be published through the API.
     from django.utils import timezone
@@ -1682,10 +2117,27 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
                                  content_type="application/json")
     assert reapproval.status_code == 200, reapproval.content
     assert reapproval.json()["version"] == 3
+    client_list = client_test_client.get("/api/v1/plan-audits/")
+    assert client_list.status_code == 200
+    client_metadata = next(item for item in client_list.json() if item["id"] == audit_id)
+    assert client_metadata["summary_import_id"] is None
     assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/overview/").status_code == 200
-    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/results/").status_code == 200
+    client_results = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/results/")
+    assert client_results.status_code == 200
+    assert all("source_references" not in row for row in client_results.json()["results"])
+    client_quality = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/quality/")
+    assert client_quality.status_code == 200
+    assert "import_quality" not in client_quality.json()
+    for suffix in ("historical-spending/", "drug-analysis/", "hospital-comparison/",
+                   "asp-benchmark/", "savings/", "network-validation/"):
+        response = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/{suffix}")
+        assert response.status_code == 200, (suffix, response.content)
+        assert "source_references" not in response.content.decode("utf-8")
     assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/report/").status_code == 200
-    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/export-csv/").status_code == 200
+    client_csv = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/export-csv/")
+    assert client_csv.status_code == 200
+    assert "source_references" not in client_csv.content.decode("utf-8")
+    assert "claims_summary_import_id" not in client_csv.content.decode("utf-8")
 
     # A failed v4 calculation must not restore v3 client publication.
     monkeypatch.setattr(plan_audit_run, "run_plan_audit", lambda *_args: (_ for _ in ()).throw(RuntimeError("fixture failure")))
@@ -2077,6 +2529,7 @@ def test_synthea_dataset_registration_and_category(client):
 
 def test_synthea_summary_and_quality_endpoint(client):
     from pricing.models import ClaimsExplorerDataset, PlanOrganization
+    from pricing.claims_views import _synthea_manifest_path
 
     org = PlanOrganization.objects.create(
         organization_name="Synthea Analytics Org", organization_type="employer",
@@ -2089,6 +2542,12 @@ def test_synthea_summary_and_quality_endpoint(client):
     ClaimsExplorerDataset.objects.create(
         organization=org, dataset_identifier="synthea_sample_data", category="synthetic_demo",
     )
+
+    if not _synthea_manifest_path().is_file():
+        unavailable = client.get(f"/api/v1/claims/synthea/summary/?organization_id={org.pk}")
+        assert unavailable.status_code == 503
+        assert "manifest is unavailable" in unavailable.json()["error"].lower()
+        return
 
     # 200 after registration
     res = client.get(f"/api/v1/claims/synthea/summary/?organization_id={org.pk}")
@@ -2110,6 +2569,7 @@ def test_synthea_summary_and_quality_endpoint(client):
 
 def test_synthea_subtable_queries_and_privacy(client):
     from pricing.models import ClaimsExplorerDataset, PlanOrganization
+    from pricing.claims_views import _synthea_manifest_path
 
     org = PlanOrganization.objects.create(
         organization_name="Synthea Subtables Org", organization_type="broker",
@@ -2117,6 +2577,15 @@ def test_synthea_subtable_queries_and_privacy(client):
     ClaimsExplorerDataset.objects.create(
         organization=org, dataset_identifier="synthea_sample_data", category="synthetic_demo",
     )
+
+    if not _synthea_manifest_path().is_file():
+        unavailable = client.get("/api/v1/claims/", {
+            "organization_id": org.pk, "dataset": "synthea_sample_data",
+            "subtable": "encounters", "page_size": 10,
+        })
+        assert unavailable.status_code == 503
+        assert "unavailable" in unavailable.json()["error"].lower()
+        return
 
     # 1. Encounters query
     enc_res = client.get("/api/v1/claims/", {
