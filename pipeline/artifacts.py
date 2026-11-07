@@ -20,6 +20,7 @@ LEGACY_REFERENCE_ARTIFACTS = {
     "crosswalk": ("ref_ndc_hcpcs.parquet",),
     "ndc_products": ("ref_ndc_product.parquet",),
     "ndc_packages": ("ref_ndc_package.parquet",),
+    "enrollments": ("ref_ccn_npi.parquet",),
 }
 
 NORMALIZED_ARTIFACTS = {

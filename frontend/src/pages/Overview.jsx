@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { fmt, useApi } from "../api.js";
+import { downloadFile, fmt, useApi } from "../api.js";
 import { Loading, MarkupBars, Table } from "../components.jsx";
 
 const hasRole = (user, ...roles) => user?.roles?.some((role) => roles.includes(role));
@@ -26,27 +26,63 @@ function DashboardMetric({ label, state, value, detail }) {
   </article>;
 }
 
+function AdminDashboard() {
+  const organizations = useApi("organizations");
+  const accounts = useApi("user-accounts");
+  const jobs = useApi("data-sources/processing-jobs", { limit: 5 });
+  const quality = useApi("hospital-file-quality");
+  const runs = useApi("plan-audits");
+  const users = accounts.data || [];
+  const activeRuns = (runs.data || []).filter((run) => ["running", "needs_review", "completed"].includes(run.status));
+  return <DashboardFrame role="Admin" title="Platform administration" description="Monitor authorized organization, account, pipeline, audit and quality status."
+    links={[["/user-management", "Manage users"], ["/plan-specific-audits", "Monitor audits"],
+      ["/data-sources", "Source pipeline"], ["/audit-logs", "Audit logs"], ["/application-settings", "Platform settings"]]}>
+    <section className="kpi-grid" aria-label="Platform status">
+      <DashboardMetric label="Organizations" state={organizations} value={(rows) => <strong className="kpi-value">{fmt.n(rows.length)}</strong>} detail="Active organizations available to this platform" />
+      <DashboardMetric label="Active users" state={accounts} value={(rows) => <strong className="kpi-value">{fmt.n(rows.filter((row) => row.is_active).length)}</strong>} detail="Active accounts from user management" />
+      <DashboardMetric label="Audit runs" state={runs} value={(rows) => <strong className="kpi-value">{fmt.n(activeRuns.length)}</strong>} detail="Running, completed or awaiting review" />
+      <DashboardMetric label="Latest pipeline" state={jobs} value={(rows) => <strong className="kpi-value kpi-value--text">{rows[0] ? `${rows[0].job_type}: ${rows[0].status}` : "No jobs recorded"}</strong>} detail="Most recent processing job" />
+      <DashboardMetric label="Quality issues" state={quality} value={(rows) => <strong className="kpi-value">{fmt.n(rows.filter((row) => row.error).length)}</strong>} detail="Hospital file rows with parser errors" />
+    </section>
+    <section><h2>Recent pipeline jobs</h2><Loading state={jobs}>{(rows) => rows.length ? <Table rows={rows} columns={[
+      { key: "job_type", label: "Job" }, { key: "status", label: "Status" },
+      { key: "created_at", label: "Requested", render: (row) => row.created_at ? new Date(row.created_at).toLocaleString() : "—" },
+    ]} /> : <p className="note">No pipeline jobs have been recorded.</p>}</Loading></section>
+  </DashboardFrame>;
+}
+
 function AnalystDashboard() {
   const sources = useApi("data-sources");
   const jobs = useApi("data-sources/processing-jobs", { limit: 5 });
-  const scope = useApi("drug-selection-scope");
+  const organizations = useApi("organizations");
+  const plans = useApi("plans");
+  const audits = useApi("plan-audits");
+  const quality = useApi("hospital-file-quality");
   const requiredSources = (sources.data || []).filter((source) => source.required);
   const availableRequiredSources = requiredSources.filter((source) => source.status === "available").length;
   const latestJob = jobs.data?.[0];
+  const draftOrRunning = (audits.data || []).filter((audit) => ["draft", "running"].includes(audit.status)
+    || audit.calculation_status === "running").length;
   return <DashboardFrame role="Analyst" title="Data and analysis workspace"
-    description="Track data source coverage, processing status, and the CMS-ranked drug scope."
+    description="Track source coverage, pipeline runs, assigned audits, and data-quality exceptions."
     links={[["/data-sources", "Manage source imports"], ["/drug-selection-scope", "Review drug scope"],
-      ["/hospital-drug-price-comparisons", "Open comparisons"], ["/plan-specific-audits", "Plan audits"]]}>
+      ["/hospital-drug-price-comparisons", "Open comparisons"], ["/claims-explorer", "Synthetic Claims Explorer"],
+      ["/plan-specific-audits", "Plan audits"]]}>
     <section className="kpi-grid" aria-label="Analyst data status">
+      <DashboardMetric label="Assigned organizations" state={organizations}
+        value={(rows) => <strong className="kpi-value">{fmt.n(rows.length)}</strong>} detail="Organizations authorized for this account" />
+      <DashboardMetric label="Assigned plans" state={plans}
+        value={(rows) => <strong className="kpi-value">{fmt.n(rows.length)}</strong>} detail="Plans authorized for this account" />
       <DashboardMetric label="Required source coverage" state={sources}
-        value={(data) => <strong className="kpi-value">{availableRequiredSources} / {requiredSources.length}</strong>}
+        value={() => <strong className="kpi-value">{availableRequiredSources} / {requiredSources.length}</strong>}
         detail="Configured required data sources available" />
       <DashboardMetric label="Latest pipeline job" state={jobs}
-        value={(data) => <strong className="kpi-value kpi-value--text">{latestJob ? `${latestJob.job_type}: ${latestJob.status}` : "No pipeline jobs"}</strong>}
-        detail={latestJob?.finished_at ? `Completed ${new Date(latestJob.finished_at).toLocaleDateString()}` : "Processing queue status"} />
-      <DashboardMetric label="CMS drug scope" state={scope}
-        value={(data) => <strong className="kpi-value">{data.selected_count ?? "—"} / {data.target_count ?? "—"}</strong>}
-        detail={scope.data?.source_file ? scope.data.source_file.split(/[\\/]/).pop() : (scope.data?.reason || "CMS Part B spending source")} />
+        value={() => <strong className="kpi-value kpi-value--text">{latestJob ? `${latestJob.job_type}: ${latestJob.status}` : "No pipeline jobs"}</strong>}
+        detail={latestJob?.finished_at ? `Completed ${new Date(latestJob.finished_at).toLocaleString()}` : "Current job status from the processing queue"} />
+      <DashboardMetric label="Draft or running audits" state={audits}
+        value={() => <strong className="kpi-value">{fmt.n(draftOrRunning)}</strong>} detail="Current assigned audit work" />
+      <DashboardMetric label="Data quality exceptions" state={quality}
+        value={(rows) => <strong className="kpi-value">{fmt.n(rows.filter((row) => row.error).length)}</strong>} detail="Hospital file parser errors" />
     </section>
     <section><h2>Recent processing jobs</h2>
       <Loading state={jobs}>{(rows) => rows.length ? <Table rows={rows} columns={[
@@ -64,7 +100,11 @@ function ReviewerDashboard() {
   const audits = useApi("plan-audits");
   const reportRows = reports.data || [];
   const awaitingRelease = reportRows.filter((report) => report.status === "generated").length;
-  const needsPlanReview = (audits.data || []).filter((audit) => audit.status === "needs_review").length;
+  const planRows = audits.data || [];
+  const needsPlanReview = planRows.filter((audit) => audit.can_view_results && audit.publication_status === "pending").length;
+  const recentDecisions = planRows.filter((audit) => audit.latest_publication_decision)
+    .sort((a, b) => String(b.latest_publication_decision.reviewed_at || "").localeCompare(String(a.latest_publication_decision.reviewed_at || "")))
+    .slice(0, 5);
   return <DashboardFrame role="Reviewer" title="Review and release workspace"
     description="See clinical unit exceptions, reports awaiting release, and plan audits requiring review."
     links={[["/drug-unit-validations", "Review drug units"], ["/reports", "Review and release reports"],
@@ -78,8 +118,9 @@ function ReviewerDashboard() {
         detail={reportRows[0]?.name || "Current report builds"} />
       <DashboardMetric label="Plan audits needing review" state={audits}
         value={(data) => <strong className="kpi-value">{needsPlanReview}</strong>}
-        detail="Assigned plan audits marked needs review" />
+        detail="Assigned completed versions awaiting independent review" />
     </section>
+    <p className="note">Approval eligibility is checked for each audit version. A creator, run initiator, or artifact builder cannot approve that version.</p>
     <section><h2>Current report status</h2>
       <Loading state={reports}>{(rows) => rows.length ? <Table rows={rows} columns={[
         { key: "name", label: "Report" }, { key: "status", label: "Status" },
@@ -87,32 +128,54 @@ function ReviewerDashboard() {
         { key: "built_by", label: "Built by", render: (row) => row.built_by || "—" },
       ]} /> : <p className="note">No current report build is available.</p>}</Loading>
     </section>
+    <section><h2>Recent plan audit decisions</h2>
+      <Loading state={audits}>{() => recentDecisions.length ? <Table rows={recentDecisions} columns={[
+        { key: "audit_name", label: "Audit" }, { key: "organization_name", label: "Organization" },
+        { key: "latest_publication_decision", label: "Decision", render: (row) => row.latest_publication_decision.status },
+        { key: "latest_publication_decision", label: "Reviewed", render: (row) => row.latest_publication_decision.reviewed_at ? new Date(row.latest_publication_decision.reviewed_at).toLocaleString() : "—" },
+      ]} /> : <p className="note">No plan audit review decisions are recorded for your assigned organizations.</p>}</Loading>
+    </section>
   </DashboardFrame>;
 }
 
 function ClientDashboard() {
   const audits = useApi("plan-audits");
+  const published = (audits.data || []).filter((audit) => audit.can_view_results && audit.publication_status === "published")
+    .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+  const latest = published[0];
+  const overview = useApi(latest ? `plan-audits/${latest.id}/overview` : null, null, [latest?.id]);
+  const metrics = overview.data?.metrics || {};
   return <DashboardFrame role="Client" title="Your approved plan audits"
-    description="View only approved reports for organizations assigned to your account."
+    description="View published reports and verified financial summaries for organizations assigned to your account."
     links={[["/plan-specific-audits", "Open approved plan audits"], ["/reports", "Market report"],
       ["/methodology", "Methodology"]]}>
     <section className="kpi-grid" aria-label="Assigned approved audits">
       <DashboardMetric label="Approved plan audits" state={audits}
-        value={(rows) => <strong className="kpi-value">{rows.length}</strong>}
+        value={() => <strong className="kpi-value">{published.length}</strong>}
         detail="Available to your assigned organizations" />
+      <DashboardMetric label="Latest historical spend" state={overview}
+        value={() => <strong className="kpi-value">{fmt.usd(metrics.visible_allowed_amount)}</strong>}
+        detail={latest ? `${latest.reporting_period} · published audit totals` : "Available after report approval"} />
+      <DashboardMetric label="Verified savings opportunities" state={overview}
+        value={() => <strong className="kpi-value">{metrics.potential_allowed_savings == null ? "—" : fmt.usd(metrics.potential_allowed_savings)}</strong>}
+        detail="Only opportunities with clinical and data validation" />
     </section>
     <section><h2>Available audits</h2>
-      <Loading state={audits}>{(rows) => rows.length ? <Table rows={rows} columns={[
+      <Loading state={audits}>{() => published.length ? <Table rows={published} columns={[
         { key: "audit_name", label: "Audit" }, { key: "organization_name", label: "Organization" },
         { key: "plan_name", label: "Plan" }, { key: "reporting_period", label: "Reporting period" },
-        { key: "status", label: "Status" },
+        { key: "publication_status", label: "Status" },
       ]} /> : <p className="note">No approved plan audits are currently assigned to your account.</p>}</Loading>
+      {latest && <div className="role-dashboard-links" aria-label="Latest approved report downloads">
+        <button type="button" onClick={() => downloadFile(`plan-audits/${latest.id}/report/`, `plan-audit-${latest.id}.pdf`)}>Download latest PDF</button>
+        <button type="button" onClick={() => downloadFile(`plan-audits/${latest.id}/export-csv/`, `plan-audit-${latest.id}.csv`)}>Download latest CSV</button>
+      </div>}
     </section>
   </DashboardFrame>;
 }
 
 export default function Overview({ user }) {
-  if (hasRole(user, "SUPER_ADMIN", "Admin")) return <MarketOverview user={user} />;
+  if (hasRole(user, "SUPER_ADMIN", "Admin")) return <AdminDashboard />;
   if (hasRole(user, "ANALYST")) return <AnalystDashboard />;
   if (hasRole(user, "REVIEWER")) return <ReviewerDashboard />;
   return <ClientDashboard />;

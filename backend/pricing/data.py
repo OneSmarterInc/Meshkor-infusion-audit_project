@@ -43,7 +43,8 @@ def files() -> dict[str, Path]:
         "hospitals_ref": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["hospitals"]),
         "nadac": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["nadac"]),
         "providers": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["providers"]),
-        "enrollments": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["enrollments"]),
+        "enrollments": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["enrollments"],
+                               LEGACY_REFERENCE_ARTIFACTS["enrollments"]),
         "scope": stored(p["ref"], "ref", REFERENCE_ARTIFACTS["drug_scope"]),
         "quality": stored(p["hpt_norm"], "hpt/norm", NORMALIZED_ARTIFACTS["hospital_quality"]),
     }

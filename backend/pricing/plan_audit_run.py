@@ -229,8 +229,12 @@ def audit_results(request, audit_id):
         queryset = queryset.filter(data_quality_status=request.query_params["data_quality_status"])
     total = queryset.count()
     rows = queryset[offset:offset + limit]
+    serialized = [result_payload(row) for row in rows]
+    if is_client_only(request.user):
+        for item in serialized:
+            item.pop("source_references", None)
     return Response({"count": total, "limit": limit, "offset": offset,
-                     "results": [result_payload(row) for row in rows]})
+                     "results": serialized})
 
 
 @api_view(["GET"])
@@ -458,24 +462,45 @@ def _paged_audit_response(request, queryset, serialize, *, default_limit=200, ma
     })
 
 
+
 @api_view(["GET"])
 @permission_classes([CanView])
 def hospital_comparison(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
-    rows = (run_results(current_audit_run(audit))
-            .exclude(hospital_price_per_unit__isnull=True).order_by("pk"))
+    rows = (
+        run_results(current_audit_run(audit))
+        .exclude(hospital_price_per_unit__isnull=True)
+        .order_by("pk")
+    )
+
     def serialize(row):
-        return {
-        "hcpcs_code": row.hcpcs_code, "site_npi": row.site_npi,
-        "quarter": row.quarter, "service_setting": row.service_setting,
-        "plan_allowed_price_per_unit": _decimal_text(row.plan_allowed_price_per_unit),
-        "hospital_reported_price_per_unit": _decimal_text(row.hospital_price_per_unit),
-        "hospital_markup_multiple": _decimal_text(row.hospital_markup_multiple),
-        "plan_to_hospital_price_multiple": _decimal_text(row.plan_to_hospital_price_multiple),
-        "data_quality_status": row.data_quality_status,
-        "source_references": row.source_references,
-        "interpretation": "Hospital-reported reference price; not the employer plan's contracted rate.",
+        result = {
+            "hcpcs_code": row.hcpcs_code,
+            "site_npi": row.site_npi,
+            "quarter": row.quarter,
+            "service_setting": row.service_setting,
+            "plan_allowed_price_per_unit": _decimal_text(
+                row.plan_allowed_price_per_unit
+            ),
+            "hospital_reported_price_per_unit": _decimal_text(
+                row.hospital_price_per_unit
+            ),
+            "hospital_markup_multiple": _decimal_text(
+                row.hospital_markup_multiple
+            ),
+            "plan_to_hospital_price_multiple": _decimal_text(
+                row.plan_to_hospital_price_multiple
+            ),
+            "data_quality_status": row.data_quality_status,
+            "interpretation": (
+                "Hospital-reported reference price; "
+                "not the employer plan's contracted rate."
+            ),
         }
+        if not is_client_only(request.user):
+            result["source_references"] = row.source_references
+        return result
+
     return _paged_audit_response(request, rows, serialize)
 
 
@@ -484,19 +509,36 @@ def hospital_comparison(request, audit_id):
 def asp_benchmark(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
     rows = run_results(current_audit_run(audit)).order_by(
-        "hcpcs_code", "quarter", "site_npi", "service_setting", "pk"
+        "hcpcs_code", "quarter", "site_npi",
+        "service_setting", "pk"
     )
+
     def serialize(row):
-        return {
-        "hcpcs_code": row.hcpcs_code, "site_npi": row.site_npi,
-        "quarter": row.quarter, "plan_allowed_price_per_unit": _decimal_text(row.plan_allowed_price_per_unit),
-        "plan_paid_price_per_unit": _decimal_text(row.plan_paid_price_per_unit),
-        "asp_payment_limit": _decimal_text(row.asp_payment_limit),
-        "allowed_markup_multiple": _decimal_text(row.allowed_markup_multiple),
-        "paid_markup_multiple": _decimal_text(row.paid_markup_multiple),
-        "data_quality_status": row.data_quality_status,
-        "source_references": row.source_references,
+        result = {
+            "hcpcs_code": row.hcpcs_code,
+            "site_npi": row.site_npi,
+            "quarter": row.quarter,
+            "plan_allowed_price_per_unit": _decimal_text(
+                row.plan_allowed_price_per_unit
+            ),
+            "plan_paid_price_per_unit": _decimal_text(
+                row.plan_paid_price_per_unit
+            ),
+            "asp_payment_limit": _decimal_text(
+                row.asp_payment_limit
+            ),
+            "allowed_markup_multiple": _decimal_text(
+                row.allowed_markup_multiple
+            ),
+            "paid_markup_multiple": _decimal_text(
+                row.paid_markup_multiple
+            ),
+            "data_quality_status": row.data_quality_status,
         }
+        if not is_client_only(request.user):
+            result["source_references"] = row.source_references
+        return result
+
     return _paged_audit_response(request, rows, serialize)
 
 

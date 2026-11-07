@@ -261,9 +261,16 @@ def test_four_role_backend_permission_matrix():
     client_plan_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/plan-audits/")
     client_market_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/hospitals/")
     client_claims_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/claims/")
+    client_imports_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/plan-audits/imports/")
+    client_org_users_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/organizations/1/users/")
+    client_published_results_request = SimpleNamespace(
+        user=client_user, method="GET", path="/api/v1/plan-audits/1/results/")
     assert CanView().has_permission(client_plan_request, None)
     assert CanView().has_permission(client_market_request, None)
     assert not CanView().has_permission(client_claims_request, None)
+    assert not CanView().has_permission(client_imports_request, None)
+    assert not CanView().has_permission(client_org_users_request, None)
+    assert CanView().has_permission(client_published_results_request, None)
 
 
 @pytest.mark.django_db
@@ -954,6 +961,82 @@ def test_organization_and_plan_lifecycle(client):
     assert any(p["id"] == plan_id for p in plans_list.json())
 
 
+@pytest.mark.django_db
+def test_admin_account_role_and_organization_access_workflow(client):
+    """Exercise the Admin UI's account and tenant-access API contracts together."""
+    from django.contrib.auth import get_user_model
+    from django.test import Client as DjangoClient
+
+    password = "Meshkor-Test-Account-2026!"
+    created_accounts = {}
+    for role in ("ANALYST", "REVIEWER", "CLIENT"):
+        response = client.post("/api/v1/user-accounts/", {
+            "username": f"phase2-{role.lower()}", "role": role, "password": password,
+        }, content_type="application/json")
+        assert response.status_code == 201, response.content
+        created_accounts[role] = response.json()["id"]
+
+    listed = client.get("/api/v1/user-accounts/")
+    assert listed.status_code == 200
+    for role, user_id in created_accounts.items():
+        account = next(item for item in listed.json() if item["id"] == user_id)
+        assert account["roles"] == [role]
+        assert account["is_active"] is True
+
+    # A role change and deactivation are persisted by the same endpoint the UI calls.
+    role_update = client.post(f"/api/v1/user-accounts/{created_accounts['ANALYST']}/management/", {
+        "role": "ANALYST", "is_active": True,
+    }, content_type="application/json")
+    assert role_update.status_code == 200
+    assert role_update.json()["roles"] == ["ANALYST"]
+    disable = client.post(f"/api/v1/user-accounts/{created_accounts['CLIENT']}/management/", {
+        "role": "CLIENT", "is_active": False,
+    }, content_type="application/json")
+    assert disable.status_code == 200
+    assert disable.json()["is_active"] is False
+    client_user = get_user_model().objects.get(pk=created_accounts["CLIENT"])
+    assert client_user.is_active is False
+
+    organization = client.post("/api/v1/organizations/", {
+        "organization_name": "Phase 2 Workflow Test Employer", "organization_type": "employer",
+    }, content_type="application/json")
+    assert organization.status_code == 201, organization.content
+    organization_id = organization.json()["id"]
+    plan = client.post("/api/v1/plans/", {
+        "organization_id": organization_id, "plan_name": "Synthetic Test Plan",
+        "plan_reference": "PHASE2-WORKFLOW-TEST", "effective_start": "2026-01-01",
+    }, content_type="application/json")
+    assert plan.status_code == 201, plan.content
+
+    for role, user_id in created_accounts.items():
+        grant = client.post(f"/api/v1/organizations/{organization_id}/users/", {"user_id": user_id},
+                            content_type="application/json")
+        assert grant.status_code == (400 if role == "CLIENT" else 201), grant.content
+        if role != "CLIENT":
+            user = get_user_model().objects.get(pk=user_id)
+            role_client = mfa_force_login(DjangoClient(), user)
+            assert any(item["id"] == organization_id
+                       for item in role_client.get("/api/v1/organizations/").json())
+            assert any(item["id"] == plan.json()["id"]
+                       for item in role_client.get("/api/v1/plans/", {"organization_id": organization_id}).json())
+
+    # Re-enable the Client through the Admin action, grant access, then revoke it.
+    enable = client.post(f"/api/v1/user-accounts/{created_accounts['CLIENT']}/management/", {
+        "role": "CLIENT", "is_active": True,
+    }, content_type="application/json")
+    assert enable.status_code == 200
+    assert client.post(f"/api/v1/organizations/{organization_id}/users/",
+                       {"user_id": created_accounts["CLIENT"]}, content_type="application/json").status_code == 201
+    client_account = get_user_model().objects.get(pk=created_accounts["CLIENT"])
+    role_client = mfa_force_login(DjangoClient(), client_account)
+    assert any(item["id"] == organization_id for item in role_client.get("/api/v1/organizations/").json())
+    revoke = client.delete(
+        f"/api/v1/organizations/{organization_id}/users/{created_accounts['CLIENT']}/")
+    assert revoke.status_code == 204
+    assert role_client.get("/api/v1/organizations/").json() == []
+    assert role_client.get("/api/v1/plans/", {"organization_id": organization_id}).json() == []
+
+
 def test_claims_explorer_organization_scoping_and_privacy(client, db):
     from django.contrib.auth import get_user_model
     from django.contrib.auth.models import Group
@@ -984,6 +1067,17 @@ def test_claims_explorer_organization_scoping_and_privacy(client, db):
         "dataset_identifier": "desynpuf_inpatient_claims_sample_1",
     }, content_type="application/json")
     assert unauthorized_registration.status_code == 403
+
+    reviewer_group, _ = Group.objects.get_or_create(name="REVIEWER")
+    reviewer_user = get_user_model().objects.create_user(username="claims-reviewer", password="test-password")
+    reviewer_user.groups.add(reviewer_group)
+    PlanOrganizationAccess.objects.create(organization=org1, user=reviewer_user)
+    reviewer_client = DjangoClient()
+    mfa_force_login(reviewer_client, reviewer_user)
+    assert reviewer_client.get("/api/v1/claims/datasets/", {"organization_id": org1.pk}).status_code == 403
+    assert reviewer_client.get("/api/v1/claims/", {
+        "organization_id": org1.pk, "dataset": "desynpuf_outpatient_claims_sample_1",
+    }).status_code == 403
 
     dataset_id = "desynpuf_outpatient_claims_sample_1"
     ClaimsExplorerDataset.objects.create(
@@ -1102,8 +1196,17 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
 
     # 2. Setup Reviewer user with organization access
     rev_group, _ = Group.objects.get_or_create(name="REVIEWER")
-    rev_user = get_user_model().objects.create_user(username="e2e-reviewer", password="test-password")
-    rev_user.groups.add(rev_group)
+    client_group, _ = Group.objects.get_or_create(name="CLIENT")
+    analyst_group, _ = Group.objects.get_or_create(name="ANALYST")
+
+    def create_role_account(username, role):
+        response = client.post("/api/v1/user-accounts/", {
+            "username": username, "role": role, "password": "Meshkor-Test-Account-2026!",
+        }, content_type="application/json")
+        assert response.status_code == 201, response.content
+        return get_user_model().objects.get(pk=response.json()["id"])
+
+    rev_user = create_role_account("e2e-reviewer", "REVIEWER")
     grant_res = client.post(f"/api/v1/organizations/{org_id}/users/", {"user_id": rev_user.pk}, content_type="application/json")
     assert grant_res.status_code == 201, grant_res.content
     assert grant_res.json()["created"] is True
@@ -1128,18 +1231,14 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
     rev_b_client = DjangoClient()
     mfa_force_login(rev_b_client, rev_b_user)
 
-    client_group, _ = Group.objects.get_or_create(name="CLIENT")
-    client_user = get_user_model().objects.create_user(username="e2e-client-user", password="test-password")
-    client_user.groups.add(client_group)
+    client_user = create_role_account("e2e-client-user", "CLIENT")
     assert client.post(f"/api/v1/organizations/{org_id}/users/", {"user_id": client_user.pk},
                        content_type="application/json").status_code in {200, 201}
     client_test_client = DjangoClient()
     mfa_force_login(client_test_client, client_user)
     assert client_test_client.post(f"/api/v1/organizations/{org_id}/users/",
                                    {"user_id": rev_user.pk}, content_type="application/json").status_code == 403
-    analyst_group, _ = Group.objects.get_or_create(name="ANALYST")
-    analyst_user = get_user_model().objects.create_user(username="mk06-analyst", password="test-password")
-    analyst_user.groups.add(analyst_group)
+    analyst_user = create_role_account("mk06-analyst", "ANALYST")
     analyst_client = DjangoClient()
     mfa_force_login(analyst_client, analyst_user)
     assert analyst_client.post(f"/api/v1/organizations/{org_id}/users/",
@@ -1388,6 +1487,14 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
         {"comments": "Unresolved fixture must not publish.", **unresolved_binding},
         content_type="application/json")
     assert unresolved_approval.status_code == 409
+    assert unresolved_approval.json()["error"] == "Resolve blocking data quality issues before publication."
+    audit_obj.refresh_from_db()
+    run_obj.refresh_from_db()
+    assert run_obj.calculation_status == "completed"
+    assert run_obj.publication_status == "pending"
+    assert audit_obj.published_version is None
+    assert not AuditReview.objects.filter(audit_run=run_obj, review_status="approved").exists()
+    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/results/").status_code == 404
 
     # Legacy rows without current creator/run provenance cannot be published through the API.
     from django.utils import timezone
@@ -1787,10 +1894,27 @@ def test_end_to_end_plan_audit_workflow(client, db, tmp_path, monkeypatch):
                                  content_type="application/json")
     assert reapproval.status_code == 200, reapproval.content
     assert reapproval.json()["version"] == 3
+    client_list = client_test_client.get("/api/v1/plan-audits/")
+    assert client_list.status_code == 200
+    client_metadata = next(item for item in client_list.json() if item["id"] == audit_id)
+    assert client_metadata["summary_import_id"] is None
     assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/overview/").status_code == 200
-    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/results/").status_code == 200
+    client_results = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/results/")
+    assert client_results.status_code == 200
+    assert all("source_references" not in row for row in client_results.json()["results"])
+    client_quality = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/quality/")
+    assert client_quality.status_code == 200
+    assert "import_quality" not in client_quality.json()
+    for suffix in ("historical-spending/", "drug-analysis/", "hospital-comparison/",
+                   "asp-benchmark/", "savings/", "network-validation/"):
+        response = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/{suffix}")
+        assert response.status_code == 200, (suffix, response.content)
+        assert "source_references" not in response.content.decode("utf-8")
     assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/report/").status_code == 200
-    assert client_test_client.get(f"/api/v1/plan-audits/{audit_id}/export-csv/").status_code == 200
+    client_csv = client_test_client.get(f"/api/v1/plan-audits/{audit_id}/export-csv/")
+    assert client_csv.status_code == 200
+    assert "source_references" not in client_csv.content.decode("utf-8")
+    assert "claims_summary_import_id" not in client_csv.content.decode("utf-8")
 
     # A failed v4 calculation must not restore v3 client publication.
     monkeypatch.setattr(plan_audit_run, "run_plan_audit", lambda *_args: (_ for _ in ()).throw(RuntimeError("fixture failure")))
