@@ -68,13 +68,14 @@ function UserAuthenticator() {
 
 function AdminConfiguration() {
   const state = useApi("application-settings");
-  return <>
+  return <details className="application-configuration">
+    <summary>Audit configuration</summary>
     <Loading state={state}>{(cfg) => <>
       <section><h2>Report scope</h2><p>{cfg.report.title} · Target {cfg.report.target_drug_count} drugs</p><ul>{cfg.report.required_inputs.map((x) => <li key={x.key}>{x.label}: {x.purpose}</li>)}</ul></section>
-      <section><h2>Comparison rules</h2><p>Benchmark quarter: <code>{cfg.comparison.benchmark_quarter}</code></p><p>Review range: <code>{cfg.comparison.review_range?.join("× to ")}×</code></p><p>Operational database: <code>{cfg.database_backend}</code></p><p>Hospital market frame: <code>{cfg.hospital_taxonomy.state_code}</code> · {cfg.hospital_taxonomy.hospital_types.join(", ")}</p><p>Included primary taxonomy codes: <code>{cfg.hospital_taxonomy.taxonomy_codes.join(", ") || "None configured"}</code></p><p>Border ZIP3 codes: <code>{cfg.hospital_taxonomy.border_zip3.join(", ") || "None configured"}</code></p></section>
-      <section><h2>Unit conversion policy</h2><p>{cfg.units.unresolved_policy}</p><p>Mass conversion factors (mg base): <code>{Object.entries(cfg.units.mass_to_mg).map(([unit, factor]) => `${unit}=${factor}`).join(", ")}</code></p><p>Volume and package units require verified NDC reference data; no conversion is inferred from hospital description text.</p></section>
+      <section><h2>Comparison rules</h2><p><b>Benchmark quarter:</b> {cfg.comparison.benchmark_quarter}</p><p><b>Review range:</b> {cfg.comparison.review_range?.join("× to ")}×</p><p><b>Market coverage:</b> {cfg.hospital_taxonomy.state_code} · {cfg.hospital_taxonomy.hospital_types.join(", ")}</p><p><b>Provider specialties:</b> {cfg.hospital_taxonomy.taxonomy_codes.join(", ") || "None configured"}</p><p><b>Border ZIP prefixes:</b> {cfg.hospital_taxonomy.border_zip3.join(", ") || "None configured"}</p></section>
+      <section><h2>Unit conversion policy</h2><p>{cfg.units.unresolved_policy}</p><p><b>Mass conversion factors:</b> {Object.entries(cfg.units.mass_to_mg).map(([unit, factor]) => `${unit} = ${factor}`).join(", ")}</p><p>Volume and package units require verified NDC reference data; no conversion is inferred from hospital description text.</p></section>
     </>}</Loading>
-  </>;
+  </details>;
 }
 
 export default function Settings({ user }) {
@@ -82,8 +83,8 @@ export default function Settings({ user }) {
   return <>
     <h1>{isAdmin ? "Application settings" : "Account security"}</h1>
     <p className="lede">{isAdmin
-      ? "Read-only project configuration and account security controls. Analytical rules are defined in the versioned project configuration."
-      : "Set up and manage the authenticator required for every account."}</p>
+      ? "Account security and audit settings."
+      : "Manage your sign-in security."}</p>
     {isAdmin && <AdminConfiguration />}
     <UserAuthenticator />
   </>;

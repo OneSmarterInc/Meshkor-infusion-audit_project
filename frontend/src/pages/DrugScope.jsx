@@ -11,14 +11,13 @@ export default function DrugScope({ user }) {
   ];
   if (isAdmin) columns.push({ key: "unit_review", label: "Unit review", render: (r) => r.unit_review?.reviewer__username || r.reviewed_by || r.unit_review?.status || "Pending" });
   return <>
-    <h1>Drug scope</h1>
-    <p className="lede">The selected codes are ranked from the current CMS Medicare Part B spending source. There is no fallback list.</p>
+    <p className="lede">Selected drugs ranked by annual Medicare Part B spending.</p>
     <Loading state={state}>{(scope) => <>
       {scope.status === "blocked" && <div className="banner"><b>Scope not available.</b> {scope.reason}</div>}
       <section><div className="stats">
         <div className="stat"><div className="stat-label">Selected drugs</div><div className="stat-value">{fmt.n(scope.selected_count)} / {fmt.n(scope.target_count)}</div></div>
         <div className="stat"><div className="stat-label">Spend year</div><div className="stat-value">{scope.spend_year || "—"}</div></div>
-        <div className="stat"><div className="stat-label">Source</div><div className="stat-value">{scope.source || "Missing"}</div><div className="stat-hint">{scope.source_file || "CMS source file required"}</div></div>
+        <div className="stat"><div className="stat-label">Source</div><div className="stat-value">{scope.source || "Missing"}</div><div className="stat-hint">{scope.source_file ? scope.source_file.split(/[\\/]/).pop() : "CMS spending reference"}</div></div>
       </div></section>
       <section><h2>Selected HCPCS codes</h2><Table rows={scope.drugs || []} columns={columns} empty="No CMS spend-ranked scope is available." /></section>
     </>}</Loading>

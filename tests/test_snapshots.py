@@ -62,3 +62,11 @@ def test_pipeline_outputs_can_target_an_isolated_stage_without_moving_raw_inputs
     assert resolved["ref"] == output / "data" / "ref"
     assert resolved["hpt_norm"] == output / "data" / "hpt" / "norm"
     assert resolved["mart"] == output / "data" / "mart"
+
+
+def test_pipeline_mutex_supports_nonblocking_liveness_probe(tmp_path):
+    project = tmp_path / "project"
+    with snapshots.pipeline_mutex(project, blocking=False) as acquired:
+        assert acquired is True
+    with snapshots.pipeline_mutex(project, blocking=False) as acquired_after_release:
+        assert acquired_after_release is True

@@ -26,7 +26,18 @@ const PlanAudits = lazy(() => import("./pages/PlanAudits.jsx"));
 const ClaimsExplorer = lazy(() => import("./pages/ClaimsExplorer.jsx"));
 const ClientPlanAudits = lazy(() => import("./pages/ClientPlanAudits.jsx"));
 
-function Landing({ onLogin }) {
+function ThemeToggle({ theme, onToggle }) {
+  const dark = theme === "dark";
+  return <button
+    type="button"
+    className="theme-toggle"
+    aria-label={`Switch to ${dark ? "light" : "dark"} theme`}
+    aria-pressed={dark}
+    onClick={onToggle}
+  ><span aria-hidden="true">{dark ? "☀" : "☾"}</span><span>{dark ? "Light" : "Dark"}</span></button>;
+}
+
+function Landing({ onLogin, theme, onToggleTheme }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [otpCode, setOtpCode] = useState("");
@@ -107,15 +118,16 @@ function Landing({ onLogin }) {
   }
   return (
     <main className={`landing ${authFlowMode ? "landing--auth-setup" : ""}`}>
+      <ThemeToggle theme={theme} onToggle={onToggleTheme} />
       {!authFlowMode && <section className="landing-copy">
         <div className="landing-brand"><span className="landing-mark">MK</span><span>MeshKor Healthcare</span></div>
         <p className="eyebrow landing-kicker">Hospital price transparency</p>
         <h1>Infusion Drug Markup Audit</h1>
-        <p className="lede">A clear, source-linked view of hospital infusion and injection prices against Medicare Part B benchmarks.</p>
+        <p className="lede">Compare hospital drug prices with Medicare Part B benchmarks.</p>
         <div className="landing-highlights">
-          <article><span className="highlight-index">01</span><div><h2>Quarter-specific benchmarks</h2><p>Compare reported rates with the CMS ASP payment limit, including the statutory 6% add-on.</p></div></article>
-          <article><span className="highlight-index">02</span><div><h2>Hospital and payer detail</h2><p>Review Ohio price variation by drug, hospital, payer group, and reported setting.</p></div></article>
-          <article><span className="highlight-index">03</span><div><h2>Evidence with context</h2><p>Source records, methodology, and data gaps stay visible throughout the audit.</p></div></article>
+          <article><span className="highlight-index">01</span><div><h2>Quarter-specific benchmarks</h2></div></article>
+          <article><span className="highlight-index">02</span><div><h2>Hospital and payer detail</h2></div></article>
+          <article><span className="highlight-index">03</span><div><h2>Source-linked results</h2></div></article>
         </div>
         <p className="landing-footnote">Market analysis for review and planning. Comparisons are not a guarantee of savings.</p>
       </section>}
@@ -184,20 +196,43 @@ function RequirePolicy({ user, policy, children }) {
   return canAccess(user, policy) ? children : <AccessDenied />;
 }
 
-function Shell({ user, onLogout }) {
+function InternalWorkspaceOnly({ user, children }) {
+  return user?.roles?.some((role) => ["SUPER_ADMIN", "ANALYST", "REVIEWER", "Admin"].includes(role))
+    ? children : <Navigate to="/" replace />;
+}
+
+function Shell({ user, onLogout, theme, onToggleTheme }) {
   const [collapsed, setCollapsed] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [search, setSearch] = useState("");
   const location = useLocation();
   const navigate = useNavigate();
-  const titles = { "/": "Overview", "/reference-data-sets": "Reference data", "/hospital-price-transparency-files": "Hospital price files", "/hospitals": "Hospitals", "/drug-selection-scope": "Drug selection scope", "/drug-unit-validations": "Drug unit validations", "/hospital-drug-price-comparisons": "Hospital drug price comparisons", "/data-sources": "Data sources", "/reports": "Reports & exports", "/plan-specific-audits": "Plan-specific audits", "/claims-explorer": "Claims Explorer", "/claims": "Claims Explorer", "/audit-logs": "Audit logs", "/application-settings": "Application settings", "/hospital-file-quality": "Hospital file quality", "/methodology": "Methodology", "/user-management": "User management" };
+  const titles = { "/": "Overview", "/reference-data-sets": "Reference data", "/hospital-price-transparency-files": "Ohio hospital catalog", "/hospitals": "Hospitals", "/drug-selection-scope": "Drug scope", "/drug-unit-validations": "Drug unit review", "/hospital-drug-price-comparisons": "Price comparisons", "/data-sources": "Data imports", "/reports": "Reports and exports", "/plan-specific-audits": "Plan audits", "/claims-explorer": "Claims explorer", "/claims": "Claims explorer", "/audit-logs": "Audit log", "/application-settings": "Application settings", "/hospital-file-quality": "Hospital file quality", "/methodology": "Methodology", "/user-management": "User management" };
   const pageTitle = titles[location.pathname] || "Infusion Drug Markup Audit";
+  useEffect(() => setMobileNavOpen(false), [location.pathname]);
+  useEffect(() => {
+    if (!mobileNavOpen) return undefined;
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setMobileNavOpen(false);
+    };
+    const closeOnDesktop = () => {
+      if (window.innerWidth > 720) setMobileNavOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    window.addEventListener("resize", closeOnDesktop);
+    return () => {
+      window.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("resize", closeOnDesktop);
+    };
+  }, [mobileNavOpen]);
   function submitSearch(event) {
     event.preventDefault();
     navigate(`/hospital-drug-price-comparisons?q=${encodeURIComponent(search.trim())}`);
   }
   return (
-    <div className={`app-layout ${collapsed ? "nav-collapsed" : ""}`}>
+    <div className={`app-layout ${collapsed ? "nav-collapsed" : ""} ${mobileNavOpen ? "mobile-nav-open" : ""}`}>
       <aside className="sidebar">
+<<<<<<< HEAD
         <div className="brand"><span className="mark">MK</span>{!collapsed && <div><div className="title">MeshKor</div><div className="sub">Healthcare analytics</div></div>}</div>
         <div className="sidebar-group"><span className="sidebar-label">AUDIT PLATFORM</span><nav aria-label="Main navigation">
           <NavLink to="/" end><span>◫</span>{!collapsed && "Overview"}</NavLink>
@@ -207,12 +242,34 @@ function Shell({ user, onLogout }) {
           {canAccess(user, "planAudits") && <NavLink to="/plan-specific-audits"><span>◉</span>{!collapsed && (hasRole(user, "REVIEWER") && !hasRole(user, "ANALYST", "SUPER_ADMIN") ? "Review Queue" : "Plan Audits")}</NavLink>}
           {canAccess(user, "claims") && <NavLink to="/claims-explorer"><span>▦</span>{!collapsed && "Claims Explorer"}</NavLink>}
           {canAccess(user, "market") && <NavLink to="/reports"><span>▧</span>{!collapsed && "Reports"}</NavLink>}
+=======
+        <div className="brand"><span className="mark">MK</span>{!collapsed && <div><div className="title">MeshKor</div><div className="sub">Healthcare analytics</div></div>}
+          <button className="mobile-menu-toggle" type="button" aria-label={mobileNavOpen ? "Close navigation menu" : "Open navigation menu"}
+            aria-controls="primary-navigation" aria-expanded={mobileNavOpen} onClick={() => setMobileNavOpen((open) => !open)}>
+            <span /><span /><span />
+          </button>
+        </div>
+        <div className="sidebar-group"><span className="sidebar-label">AUDIT PLATFORM</span><nav id="primary-navigation" aria-label="Main navigation">
+          <NavLink to="/" end><span aria-hidden="true">◫</span><span className="nav-label">Overview</span></NavLink>
+          <NavLink to="/hospitals"><span aria-hidden="true">⌂</span><span className="nav-label">Hospitals</span></NavLink>
+          {user.roles?.some((role) => ["SUPER_ADMIN", "ANALYST", "Admin"].includes(role)) && <NavLink to="/drug-selection-scope"><span aria-hidden="true">#</span><span className="nav-label">Drug Scope</span></NavLink>}
+          <NavLink to="/hospital-drug-price-comparisons"><span aria-hidden="true">↗</span><span className="nav-label">Comparisons</span></NavLink>
+          <NavLink to="/plan-specific-audits"><span aria-hidden="true">◉</span><span className="nav-label">Plan Audits</span></NavLink>
+          {user.roles?.some((role) => ["SUPER_ADMIN", "ANALYST", "REVIEWER", "Admin"].includes(role))
+            && <NavLink to="/claims-explorer"><span aria-hidden="true">▦</span><span className="nav-label">Claims Explorer</span></NavLink>}
+          <NavLink to="/reports"><span aria-hidden="true">▧</span><span className="nav-label">Reports</span></NavLink>
+>>>>>>> 608ea3c8470f8e42f83b161e5d65ffd9931a5c15
           <details className="sidebar-more">
-            <summary><span>•••</span>{!collapsed && "More"}</summary>
+            <summary><span aria-hidden="true">•••</span><span className="nav-label">More</span></summary>
             <div className="sidebar-subnav">
               <NavLink to="/methodology">Methodology</NavLink>
+<<<<<<< HEAD
               {canAccess(user, "admin") && <>
                 <NavLink to="/hospital-price-transparency-files">Hospital Price Files</NavLink>
+=======
+              {user.roles?.some((role) => ["SUPER_ADMIN", "ANALYST", "Admin"].includes(role)) && <>
+                <NavLink to="/hospital-price-transparency-files">Ohio Hospital Catalog</NavLink>
+>>>>>>> 608ea3c8470f8e42f83b161e5d65ffd9931a5c15
                 <NavLink to="/reference-data-sets">Reference Data Sets</NavLink>
                 <NavLink to="/hospital-file-quality">Hospital File Quality</NavLink>
               </>}
@@ -233,24 +290,31 @@ function Shell({ user, onLogout }) {
         </nav></div>
         <button className="collapse-button" type="button" onClick={() => setCollapsed((v) => !v)} aria-expanded={!collapsed}>{collapsed ? "›" : "‹"}{!collapsed && " Collapse menu"}</button>
       </aside>
+      {mobileNavOpen && <button className="mobile-nav-backdrop" type="button" aria-label="Close navigation menu" onClick={() => setMobileNavOpen(false)} />}
       <div className="app-workspace">
       <header className="appbar">
         <div><div className="crumb">MeshKor Healthcare / {pageTitle}</div><h1>{pageTitle}</h1></div>
         <form className="global-search" role="search" onSubmit={submitSearch}><input aria-label="Search price comparisons" placeholder="Search hospital, payer, drug…" value={search} onChange={(e) => setSearch(e.target.value)} /><button type="submit">Search</button></form>
-        <div className="account"><div><b>{user.display_name}</b><span className="muted">{user.roles?.join(", ")}</span></div><button type="button" onClick={onLogout}>Logout</button></div>
+        <div className="account"><div><b>{user.display_name}</b><span className="muted">{user.roles?.join(", ")}</span></div><ThemeToggle theme={theme} onToggle={onToggleTheme} /><button type="button" onClick={onLogout}>Logout</button></div>
       </header>
       <main className="page-content">
         <Suspense fallback={<div className="auth-loading" role="status">Loading page…</div>}>
         <Routes>
           <Route path="/" element={<Overview user={user} />} />
+<<<<<<< HEAD
           <Route path="/reference-data-sets" element={<RequirePolicy user={user} policy="admin"><ReferenceData /></RequirePolicy>} />
           <Route path="/hospital-price-transparency-files" element={<RequirePolicy user={user} policy="admin"><HospitalFiles /></RequirePolicy>} />
+=======
+          <Route path="/reference-data-sets" element={<AnalystOrAdmin user={user}><ReferenceData /></AnalystOrAdmin>} />
+          <Route path="/hospital-price-transparency-files" element={<AnalystOrAdmin user={user}><HospitalFiles /></AnalystOrAdmin>} />
+>>>>>>> 608ea3c8470f8e42f83b161e5d65ffd9931a5c15
           <Route path="/medicare-part-b-drugs/:hcpcs" element={<DrugDetail user={user} />} />
           <Route path="/hospitals" element={<Hospitals user={user} />} />
           <Route path="/hospitals/:key" element={<HospitalDetail user={user} />} />
           <Route path="/drug-selection-scope" element={<RequirePolicy user={user} policy="drugScope"><DrugScope user={user} /></RequirePolicy>} />
           <Route path="/drug-unit-validations" element={<RequirePolicy user={user} policy="reviewer"><UnitValidation user={user} /></RequirePolicy>} />
           <Route path="/hospital-drug-price-comparisons" element={<Rates user={user} />} />
+<<<<<<< HEAD
           <Route path="/hospital-file-quality" element={<RequirePolicy user={user} policy="admin"><Quality /></RequirePolicy>} />
           <Route path="/data-sources" element={<RequirePolicy user={user} policy="analyst"><Sources user={user} /></RequirePolicy>} />
           <Route path="/reports" element={<Reports user={user} />} />
@@ -259,6 +323,16 @@ function Shell({ user, onLogout }) {
           <Route path="/claims" element={<RequirePolicy user={user} policy="claims"><Navigate to="/claims-explorer" replace /></RequirePolicy>} />
           <Route path="/audit-logs" element={<RequirePolicy user={user} policy="admin"><AuditLogs /></RequirePolicy>} />
           <Route path="/user-management" element={<RequirePolicy user={user} policy="admin"><UserManagement user={user} /></RequirePolicy>} />
+=======
+          <Route path="/hospital-file-quality" element={<AnalystOrAdmin user={user}><Quality /></AnalystOrAdmin>} />
+          <Route path="/data-sources" element={<AnalystOrAdmin user={user}><Sources user={user} /></AnalystOrAdmin>} />
+          <Route path="/reports" element={<Reports user={user} />} />
+          <Route path="/plan-specific-audits" element={<PlanAudits user={user} />} />
+          <Route path="/claims-explorer" element={<InternalWorkspaceOnly user={user}><ClaimsExplorer user={user} /></InternalWorkspaceOnly>} />
+          <Route path="/claims" element={<Navigate to="/claims-explorer" replace />} />
+          <Route path="/audit-logs" element={<AdminOnly user={user}><AuditLogs /></AdminOnly>} />
+          <Route path="/user-management" element={<AdminOnly user={user}><UserManagement user={user} /></AdminOnly>} />
+>>>>>>> 608ea3c8470f8e42f83b161e5d65ffd9931a5c15
           <Route path="/application-settings" element={<Settings user={user} />} />
           <Route path="/methodology" element={<Method />} />
           <Route path="/reference" element={<Navigate to="/reference-data-sets" replace />} />
@@ -283,6 +357,14 @@ function Shell({ user, onLogout }) {
 function App() {
   const [user, setUser] = useState(null);
   const [checking, setChecking] = useState(true);
+  const [theme, setTheme] = useState(() => {
+    try { return window.localStorage.getItem("meshkor-theme") === "dark" ? "dark" : "light"; }
+    catch { return "light"; }
+  });
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try { window.localStorage.setItem("meshkor-theme", theme); } catch { /* Storage may be unavailable in private browsing. */ }
+  }, [theme]);
   useEffect(() => {
     const clearInvalidSession = () => setUser(null);
     window.addEventListener("meshkor:session-expired", clearInvalidSession);
@@ -296,8 +378,9 @@ function App() {
     try { await logout(); } finally { setUser(null); }
   }
   if (checking) return <div className="auth-loading">Checking access…</div>;
-  return user ? <Shell user={user} onLogout={signOut} />
-    : <Landing onLogin={setUser} />;
+  const toggleTheme = () => setTheme((current) => current === "dark" ? "light" : "dark");
+  return user ? <Shell user={user} onLogout={signOut} theme={theme} onToggleTheme={toggleTheme} />
+    : <Landing onLogin={setUser} theme={theme} onToggleTheme={toggleTheme} />;
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<BrowserRouter><App /></BrowserRouter>);

@@ -64,10 +64,16 @@ function AnalystDashboard() {
   const draftOrRunning = (audits.data || []).filter((audit) => ["draft", "running"].includes(audit.status)
     || audit.calculation_status === "running").length;
   return <DashboardFrame role="Analyst" title="Data and analysis workspace"
+<<<<<<< HEAD
     description="Track source coverage, pipeline runs, and the CMS-ranked drug scope from the loaded project data."
     links={[["/data-sources", "Manage source imports"],
       ["/hospital-drug-price-comparisons", "Open comparisons"], ["/claims-explorer", "Synthetic Claims Explorer"],
       ["/plan-specific-audits", "Plan audits"]]}>
+=======
+    description="Track data source coverage, processing status, and the CMS-ranked drug scope."
+    links={[["/data-sources", "Manage source imports"], ["/drug-selection-scope", "Review drug scope"],
+      ["/hospital-drug-price-comparisons", "Open comparisons"], ["/plan-specific-audits", "Plan audits"]]}>
+>>>>>>> 608ea3c8470f8e42f83b161e5d65ffd9931a5c15
     <section className="kpi-grid" aria-label="Analyst data status">
       <DashboardMetric label="Assigned organizations" state={organizations}
         value={(rows) => <strong className="kpi-value">{fmt.n(rows.length)}</strong>} detail="Organizations authorized for this account" />
@@ -78,18 +84,25 @@ function AnalystDashboard() {
         detail="Configured required data sources available" />
       <DashboardMetric label="Latest pipeline job" state={jobs}
         value={(data) => <strong className="kpi-value kpi-value--text">{latestJob ? `${latestJob.job_type}: ${latestJob.status}` : "No pipeline jobs"}</strong>}
+<<<<<<< HEAD
         detail={latestJob?.finished_at ? `Completed ${new Date(latestJob.finished_at).toLocaleString()}` : "Current job status from the processing queue"} />
       <DashboardMetric label="Draft or running audits" state={audits}
         value={() => <strong className="kpi-value">{fmt.n(draftOrRunning)}</strong>} detail="Current assigned audit work" />
       <DashboardMetric label="Data quality exceptions" state={quality}
         value={(rows) => <strong className="kpi-value">{fmt.n(rows.filter((row) => row.error).length)}</strong>} detail="Hospital file parser errors" />
+=======
+        detail={latestJob?.finished_at ? `Completed ${new Date(latestJob.finished_at).toLocaleDateString()}` : "Processing queue status"} />
+      <DashboardMetric label="CMS drug scope" state={scope}
+        value={(data) => <strong className="kpi-value">{data.selected_count ?? "—"} / {data.target_count ?? "—"}</strong>}
+        detail={scope.data?.source_file ? scope.data.source_file.split(/[\\/]/).pop() : (scope.data?.reason || "CMS Part B spending source")} />
+>>>>>>> 608ea3c8470f8e42f83b161e5d65ffd9931a5c15
     </section>
-    <section><h2>Recent pipeline jobs</h2>
+    <section><h2>Recent processing jobs</h2>
       <Loading state={jobs}>{(rows) => rows.length ? <Table rows={rows} columns={[
         { key: "job_type", label: "Job" }, { key: "status", label: "Status" },
         { key: "progress", label: "Progress", render: (row) => `${fmt.n(row.progress)}%` },
         { key: "created_at", label: "Requested", render: (row) => new Date(row.created_at).toLocaleString() },
-      ]} /> : <p className="note">No pipeline jobs have been recorded.</p>}</Loading>
+      ]} /> : <p className="note">No processing jobs recorded.</p>}</Loading>
     </section>
   </DashboardFrame>;
 }
@@ -313,7 +326,7 @@ function MarketOverview({ user }) {
       </section>
 
       {isAdmin && m.data_is_archived_snapshot && <div className="snapshot-notice" role="status">
-        This dashboard is using the saved Parquet snapshot. Its original CMS source ZIP is not available here, so the snapshot is shown as archived until sources are uploaded and imported again.
+        Dashboard data reflects the current archived snapshot. Upload new source files to refresh the active dataset.
       </div>}
 
       {/* =========================================================================
@@ -337,7 +350,7 @@ function MarketOverview({ user }) {
                 <article className="kpi-card warning">
                   <span className="kpi-label">Files with Parse Errors</span>
                   <strong className="kpi-value">{fmt.n(summary.hospital_files_with_errors)}</strong>
-                  <small className="kpi-definition">Hospital price files with a recorded parser error</small>
+                  <small className="kpi-definition">Hospital files with parsing or formatting issues</small>
                   <div className="kpi-subtext"><Link to="/hospital-file-quality">Open file quality</Link></div>
                 </article>
                 <article className="kpi-card warning">

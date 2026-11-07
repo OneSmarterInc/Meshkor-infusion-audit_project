@@ -54,7 +54,7 @@ export default function Method() {
         <li>Official Hospital Standard Charges Price Transparency Portals</li>
         <li>CMS Hospital Price Transparency Guidelines</li>
       </ul>
-      <p>Every row keeps its source file reference, so any figure can be traced to the exact source file it came from.</p>
+      <p>Every comparison maintains direct source lineage, ensuring every figure can be traced to official hospital and CMS publications.</p>
     </section>
   );
 }

@@ -123,14 +123,20 @@ as gaps. The application does not fill them with sample data.
 - **SUPER_ADMIN** manages users, organizations, permissions, and platform settings.
 - **ANALYST** manages permitted source imports and runs permitted market and plan audits; cannot approve their own reports.
 - **REVIEWER** reviews units and evidence and can approve or reject reports.
-- **CLIENT** can access only assigned organizations' approved plan reports and cannot access public platform APIs or raw claims.
+- **CLIENT** can access assigned organizations' approved plan reports and read-only, published market-report views; cannot access operational source data, administration, or claims-explorer data.
 - Legacy Admin/Viewer accounts remain accepted for compatibility; new accounts use the four role names above.
 - All application roles enroll Google Authenticator TOTP at first sign-in.
 
+Plan-specific claims audits and organization-scoped access are implemented.
+Their results depend on the organization having authorized claims aggregates,
+an active network roster, validated billing-unit evidence, and an approved
+audit run. A deployment without those inputs will show the corresponding data
+gaps; it does not substitute sample data. Payer-file analysis is not currently
+provided.
+
 Report release requires a current complete Parquet build, clinical review for
-every selected drug, a different Admin from the report builder, and at least
-two active Admin accounts. The product does not provide plan-specific claims
-analysis, payer-file analysis, or multi-organization workspaces..
+every selected drug, an approver independent from the report builder, and at
+least two active Admin accounts.
 
 ## Verification
 
