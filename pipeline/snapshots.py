@@ -13,7 +13,8 @@ JOURNAL_NAME = "pipeline-snapshot-transaction.json"
 
 
 @contextmanager
-def pipeline_mutex(project: Path):
+def pipeline_mutex(project: Path, *, blocking: bool = True):
+    """Lock shared pipeline work; yield False when a nonblocking probe finds it busy."""
     lock_path = project / "data" / "operational" / "pipeline-jobs.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock_file:
@@ -26,20 +27,29 @@ def pipeline_mutex(project: Path):
             lock_file.seek(0)
             while True:
                 try:
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                    mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+                    msvcrt.locking(lock_file.fileno(), mode, 1)
                     break
                 except OSError:
+                    if not blocking:
+                        yield False
+                        return
                     time.sleep(0.2)
             try:
-                yield
+                yield True
             finally:
                 lock_file.seek(0)
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
-                yield
+                mode = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                fcntl.flock(lock_file.fileno(), mode)
+            except BlockingIOError:
+                yield False
+                return
+            try:
+                yield True
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 

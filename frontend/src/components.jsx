@@ -1,14 +1,15 @@
 import { useMemo, useState } from "react";
-import { Bar, BarChart, CartesianGrid, Cell, ReferenceLine, ResponsiveContainer, Tooltip,
-  XAxis, YAxis } from "recharts";
+import {
+  Bar, BarChart, CartesianGrid, Cell, ReferenceLine, ResponsiveContainer, Tooltip,
+  XAxis, YAxis
+} from "recharts";
 import { STATUS_TEXT } from "./api.js";
 
 export function Loading({ state, children }) {
   if (state.loading && !state.data) return <div className="loading-skeleton" aria-label="Loading data"><span /><span /><span /></div>;
   if (state.error) return (
-    <div className="note error">
-      <b>Could not load data.</b> {state.error.message}
-      <div>Check the API response and the latest import status under Data Sources.</div>
+    <div className="note error" role="alert">
+      <b>Unable to load this information.</b> Please try again. If the issue continues, contact an administrator.
     </div>
   );
   return children(state.data);
@@ -28,13 +29,20 @@ export function StatusPill({ status }) {
   return <span className={`pill s-${status}`}>{STATUS_TEXT[status] || status}</span>;
 }
 
+export function fileName(value) {
+  return String(value || "").split(/[\\/]/).filter(Boolean).pop() || "—";
+}
+
+export function isInternalColumn(key) {
+  return /(^|_)(path|directory|folder)(_|$)/i.test(String(key || ""));
+}
+
 export function Provisional({ reviewed }) {
   if (reviewed) return null;
   return (
     <div className="banner">
-      <b>Not yet reviewed.</b> Unit conversion for this drug has no pharmacist sign-off.
-      Treat markups as provisional until a reviewer sign-off is recorded under
-      <code> data/raw_essential_inputs/unit_reviews/</code>.
+      <b>Not yet reviewed.</b> Unit conversion for this drug has no clinical sign-off.
+      Treat markups as provisional until a reviewer sign-off is recorded in Drug Unit Validations.
     </div>
   );
 }
@@ -60,8 +68,10 @@ export function Table({ columns, rows, initialSort, empty = "No rows." }) {
           <tr>
             {columns.map((c) => (
               <th key={c.key} className={c.num ? "num" : ""}
-                onClick={() => setSort({ key: c.key,
-                  dir: sort.key === c.key && sort.dir === "desc" ? "asc" : "desc" })}>
+                onClick={() => setSort({
+                  key: c.key,
+                  dir: sort.key === c.key && sort.dir === "desc" ? "asc" : "desc"
+                })}>
                 {c.label}{sort.key === c.key ? (sort.dir === "desc" ? " ↓" : " ↑") : ""}
               </th>
             ))}

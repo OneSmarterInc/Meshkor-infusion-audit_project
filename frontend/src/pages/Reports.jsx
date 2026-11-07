@@ -3,12 +3,12 @@ import { postJSON, patchJSON, deleteJSON, useApi, downloadFile } from "../api.js
 import { Loading, Table } from "../components.jsx";
 
 const STATUS_OPTIONS = [
-  { value: "not_contacted", label: "Not Contacted" },
+  { value: "not_contacted", label: "Not contacted" },
   { value: "contacted", label: "Contacted" },
-  { value: "meeting_scheduled", label: "Meeting Scheduled" },
-  { value: "report_evaluated", label: "Report Evaluated (Counts toward milestone if feedback/evidence provided)" },
-  { value: "feedback_received", label: "Feedback Received (Counts toward milestone)" },
-  { value: "pilot_interested", label: "Pilot Interested (Counts toward milestone)" },
+  { value: "meeting_scheduled", label: "Meeting scheduled" },
+  { value: "report_evaluated", label: "Report evaluated" },
+  { value: "feedback_received", label: "Feedback received" },
+  { value: "pilot_interested", label: "Pilot interested" },
   { value: "declined", label: "Declined" },
 ];
 
@@ -180,19 +180,18 @@ export default function Reports({ user }) {
 
   return (
     <>
-      <h1>Reports & Exports</h1>
       <p className="lede">
         {isAdmin
-          ? "Review draft reports, track commercial broker evaluations, record an independent release, and export the supporting detail."
+          ? "Manage reports, releases, and broker evaluations."
           : canReviewReports
-          ? "Track current report builds, broker evaluations, and release status. Reviewers can release a completed report; downloads are available after release."
-          : "Download the current released Ohio market report and its CSV data appendix."}
+          ? "Review reports, evaluations, and release status."
+          : "Download released reports and comparison data."}
       </p>
 
       <section>
         <h2>Current market report</h2>
         <p className="muted">
-          Prices shown are posted hospital rates; they do not represent plan claims, acquisition costs, or guaranteed savings. Unit review status is shown in the underlying tables.
+          Posted hospital prices are not plan claims or guaranteed savings.
         </p>
         <div className="filters">
           <button type="button" className="button" onClick={handleDownload} disabled={downloading || !canDownload}>
@@ -238,19 +237,17 @@ export default function Reports({ user }) {
         <section style={{ marginTop: "32px", borderTop: "2px solid var(--line)", paddingTop: "24px" }}>
           <div className="panel-header">
             <div>
-              <h2 className="panel-title" style={{ fontSize: "20px" }}>Phase 4 Prerequisite: Market Report Broker Evaluations & Pilot Preparation</h2>
-              <p className="panel-subtitle">
-                Commercial business rule: The Phase 1 market report must be evaluated with three genuine brokers or TPAs before commercially starting Phase 4 paid pilots.
-              </p>
+              <h2 className="panel-title" style={{ fontSize: "20px" }}>Broker and TPA evaluations</h2>
+              <p className="panel-subtitle">Three verified evaluations unlock paid pilots.</p>
             </div>
             <div>
               {milestone.prerequisite_met ? (
                 <span className="pill s-ok" style={{ fontSize: "13px", padding: "4px 12px" }}>
-                  Prerequisite Met (3/3 Verified)
+                  Pilot prerequisite met
                 </span>
               ) : (
                 <span className="pill s-review_range" style={{ fontSize: "13px", padding: "4px 12px" }}>
-                  Prerequisite Pending ({milestone.remaining_count} remaining)
+                  Pilot prerequisite pending · {milestone.remaining_count} remaining
                 </span>
               )}
             </div>
@@ -262,39 +259,18 @@ export default function Reports({ user }) {
               <div className="stat-value" style={{ fontSize: "28px" }}>
                 {milestone.verified_count} <span style={{ fontSize: "15px", color: "var(--muted)", fontWeight: "normal" }}>/ {milestone.required_count}</span>
               </div>
-              <div className="stat-hint">
-                {milestone.distinct_organizations_verified.length > 0
-                  ? milestone.distinct_organizations_verified.join(", ")
-                  : "Zero verified evaluations recorded"}
-              </div>
+              {milestone.distinct_organizations_verified.length > 0 && <div className="stat-hint">{milestone.distinct_organizations_verified.join(", ")}</div>}
             </div>
 
             <div className="kpi-card">
-              <div className="stat-label">Remaining Required</div>
-              <div className="stat-value" style={{ fontSize: "28px" }}>{milestone.remaining_count}</div>
-              <div className="stat-hint">Distinct organizations required</div>
-            </div>
-
-            <div className="kpi-card">
-              <div className="stat-label">Total Logged Interactions</div>
+              <div className="stat-label">Interactions</div>
               <div className="stat-value" style={{ fontSize: "28px" }}>{evaluations.length}</div>
-              <div className="stat-hint">Including contacts and meetings</div>
-            </div>
-
-            <div className={`kpi-card ${milestone.prerequisite_met ? "highlight" : ""}`}>
-              <div className="stat-label">Paid Pilot Status</div>
-              <div className="stat-value" style={{ fontSize: "20px", marginTop: "4px" }}>
-                {milestone.prerequisite_met ? "Ready for Pilot" : "Blocked (Prereq Pending)"}
-              </div>
-              <div className="stat-hint">
-                {milestone.prerequisite_met ? "3 real evaluations recorded" : "Requires 3 genuine evaluations"}
-              </div>
             </div>
           </div>
 
           {!milestone.prerequisite_met && (
             <div className="banner" style={{ margin: "12px 0 20px" }}>
-              <b>Governance Notice:</b> Customer evaluations, contacts, and pilot progress must never be fabricated. A record counts as verified only when the broker/TPA has evaluated the report and provided attributable feedback notes or evidence references.
+              Only report evaluations with attributable feedback or evidence count toward the pilot prerequisite.
             </div>
           )}
 
@@ -304,28 +280,28 @@ export default function Reports({ user }) {
               className={`button ${activeTab === "evaluations" ? "" : "secondary"}`}
               onClick={() => setActiveTab("evaluations")}
             >
-              Evaluation Records ({evaluations.length})
+              Evaluations ({evaluations.length})
             </button>
             <button
               type="button"
               className={`button ${activeTab === "package" ? "" : "secondary"}`}
               onClick={() => setActiveTab("package")}
             >
-              Broker Package & Scope
+              Product scope
             </button>
             <button
               type="button"
               className={`button ${activeTab === "questions" ? "" : "secondary"}`}
               onClick={() => setActiveTab("questions")}
             >
-              7 Evaluation Questions
+              Questions
             </button>
             <button
               type="button"
               className={`button ${activeTab === "checklist" ? "" : "secondary"}`}
               onClick={() => setActiveTab("checklist")}
             >
-              15-Step Pilot Checklist
+              Onboarding
             </button>
           </div>
 
@@ -337,7 +313,7 @@ export default function Reports({ user }) {
                     <div>
                       <h3 className="panel-title">{editingId ? "Edit Evaluation Record" : "Record Genuine Broker/TPA Evaluation"}</h3>
                       <p className="panel-subtitle">
-                        Record real feedback from meetings, calls, or written reviews. Contacts or scheduled meetings alone do not satisfy the milestone.
+                        Record attributable feedback; contacts and scheduled meetings do not count.
                       </p>
                     </div>
                     {editingId && (
@@ -469,15 +445,12 @@ export default function Reports({ user }) {
                 <div className="panel-header">
                   <div>
                     <h3 className="panel-title">Recorded Broker / TPA Evaluations</h3>
-                    <p className="panel-subtitle">
-                      Evidence-backed log of broker and TPA market report evaluations.
-                    </p>
                   </div>
                 </div>
 
                 {evaluations.length === 0 ? (
                   <div className="note">
-                    <b>No evaluations recorded yet.</b> Contact real broker/TPA partners, present the Ohio market report, and log their genuine feedback to satisfy the Phase 4 commercial milestone.
+                    No evaluations yet. Record feedback after a broker or TPA reviews the report.
                   </div>
                 ) : (
                   <div className="table-wrap">
@@ -566,10 +539,7 @@ export default function Reports({ user }) {
 
           {activeTab === "package" && (
             <div className="dashboard-panel">
-              <h3 className="panel-title">Broker / TPA Product & Scope Overview</h3>
-              <p className="panel-subtitle">
-                Core product narrative and governance boundaries for presenting MeshKor to employee benefits brokers, consultants, and TPAs.
-              </p>
+              <h3 className="panel-title">Product scope</h3>
 
               {evalPackage.product_explanation ? (
                 <div style={{ display: "grid", gap: "16px", marginTop: "12px" }}>
@@ -620,10 +590,7 @@ export default function Reports({ user }) {
             <div className="dashboard-panel">
               <div className="panel-header">
                 <div>
-                  <h3 className="panel-title">7 Broker / TPA Evaluation Questions</h3>
-                  <p className="panel-subtitle">
-                    Standard interview and review questions to evaluate report relevance, actionability, and interest in a plan audit pilot.
-                  </p>
+                  <h3 className="panel-title">Evaluation questions</h3>
                 </div>
                 <div>
                   <button
@@ -631,7 +598,7 @@ export default function Reports({ user }) {
                     className="button"
                     onClick={() => handleCopyQuestions(evalPackage.evaluation_questions)}
                   >
-                    {copiedQuestions ? "✓ Questions Copied!" : "Copy Questions to Clipboard"}
+                    {copiedQuestions ? "Copied" : "Copy questions"}
                   </button>
                 </div>
               </div>
@@ -670,10 +637,7 @@ export default function Reports({ user }) {
             <div className="dashboard-panel">
               <div className="panel-header">
                 <div>
-                  <h3 className="panel-title">15-Step Paid Pilot Onboarding Checklist</h3>
-                  <p className="panel-subtitle">
-                    Prerequisite technical, governance, and analytical workflow for onboarding an authorized self-funded employer or TPA.
-                  </p>
+                  <h3 className="panel-title">Pilot onboarding</h3>
                 </div>
               </div>
 
@@ -684,8 +648,7 @@ export default function Reports({ user }) {
                       <tr>
                         <th style={{ width: "60px" }}>Step</th>
                         <th>Milestone / Activity</th>
-                        <th>Operational Description</th>
-                        <th style={{ width: "100px" }}>Requirement</th>
+                        <th>Details</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -699,9 +662,6 @@ export default function Reports({ user }) {
                           </td>
                           <td style={{ fontSize: "13px", color: "var(--muted)" }}>
                             {step.description}
-                          </td>
-                          <td>
-                            <span className="pill s-ok">Required</span>
                           </td>
                         </tr>
                       ))}

@@ -21,14 +21,13 @@ export default function UnitValidation({ user }) {
         clinical_reviewer_name: form.get("clinical_reviewer_name"),
         billing_unit: drug.billing_unit?.unit, billing_qty: drug.billing_unit?.qty,
       });
-      setMessages((m) => ({ ...m, [drug.hcpcs]: "Review recorded. An Admin must refresh the data pipeline before audit calculations use this decision." }));
+      setMessages((m) => ({ ...m, [drug.hcpcs]: "Review recorded. An administrator must refresh the comparison data before this change appears in reports." }));
       setVersion((v) => v + 1);
     } catch (error) { setMessages((m) => ({ ...m, [drug.hcpcs]: error.message })); }
     finally { setBusy(""); }
   }
   return <>
-    <h1>Unit validation</h1>
-    <p className="lede">Conversions are not treated as validated findings until the HCPCS unit and supporting evidence have been reviewed.</p>
+    <p className="lede">Review and approve CMS drug billing units.</p>
     <Loading state={state}>{(result) => <>
       {result.status === "blocked" && <div className="banner">No current spend-ranked scope is available. {result.reason}</div>}
       <section><div className="stats"><div className="stat"><div className="stat-label">Rows requiring review</div><div className="stat-value">{fmt.n(result.total)}</div></div><div className="stat"><div className="stat-label">Review workflow</div><div className="stat-value">Enabled</div><div className="stat-hint">{result.review_workflow}</div></div></div></section>
@@ -37,19 +36,13 @@ export default function UnitValidation({ user }) {
         { key: "hospital_label", label: "Hospital" }, { key: "status", label: "Status" },
         { key: "drug_unit", label: "Original unit", render: (r) => [r.drug_unit, r.drug_unit_type].filter(Boolean).join(" ") || "—" },
         { key: "billing_units", label: "HCPCS units", num: true }, { key: "unit_note", label: "Conversion note" },
-        { key: "source_file", label: "Source file" },
-        ...(canViewFinancials ? [
-          { key: "price", label: "Posted price", num: true, render: (r) => fmt.usd(r.price) },
-          { key: "asp_payment_limit", label: "ASP limit", num: true, render: (r) => fmt.usd(r.asp_payment_limit) },
-          { key: "markup_multiple", label: "Markup", num: true, render: (r) => fmt.x(r.markup_multiple) },
-        ] : []),
+        { key: "asp_payment_limit", label: "ASP limit", num: true, render: (r) => fmt.usd(r.asp_payment_limit) },
+        { key: "markup_multiple", label: "Markup", num: true, render: (r) => fmt.x(r.markup_multiple) },
       ]} empty="No unit exceptions are available for the current scope." /></section>
     </>}</Loading>
     <Loading state={scope}>{(selected) => <section><h2>CMS billing-unit review</h2>
       <p className="muted">Review decisions are tied to the exact CMS Part B source hash. Approval requires the billing quantity and unit to match the source ASP dosage.</p>
-      {selected.source_sha256 && <p className="muted">Selected scope SHA-256: {selected.source_sha256}</p>}
       {selected.status === "blocked" ? <div className="note">{selected.reason}</div> : <>
-        <p className="muted">After recording all reviews, run the Admin data refresh so the saved decisions are applied to Parquet and the comparison/report are rebuilt.</p>
         {(selected.drugs || []).map((drug) => <article className="review-card" key={drug.hcpcs}>
         <div><b>{drug.hcpcs} · {drug.name}</b><div className="muted">CMS dosage: {drug.asp_dosage || "Not available"} · current review: {drug.unit_review?.status || "Pending"}</div>
           {drug.unit_review?.clinical_reviewer_name && <div className="muted">Clinical reviewer: {drug.unit_review.clinical_reviewer_name} · {drug.unit_review.reviewed_at ? new Date(drug.unit_review.reviewed_at).toLocaleDateString() : "date unavailable"}</div>}

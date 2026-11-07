@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { getJSON, postJSON } from "../api.js";
+import { isInternalColumn } from "../components.jsx";
 
 const PAGE_SIZE = 50;
 const isAdmin = (user) => user?.roles?.some((role) => ["SUPER_ADMIN", "Admin"].includes(role));
@@ -34,7 +35,6 @@ export default function ClaimsExplorer({ user }) {
   const [subtable, setSubtable] = useState("encounters");
   const [searchQuery, setSearchQuery] = useState("");
   const [syntheaSummary, setSyntheaSummary] = useState(null);
-  const [summaryLoading, setSummaryLoading] = useState(false);
 
   // Table pagination and results
   const [page, setPage] = useState(1);
@@ -109,11 +109,9 @@ export default function ClaimsExplorer({ user }) {
       return undefined;
     }
     let alive = true;
-    setSummaryLoading(true);
     getJSON("claims/synthea/summary/", { organization_id: selectedOrg })
       .then((data) => alive && setSyntheaSummary(data))
-      .catch((e) => alive && loggerWarn(e))
-      .finally(() => alive && setSummaryLoading(false));
+      .catch((e) => alive && loggerWarn(e));
     return () => { alive = false; };
   }, [isSynthea, selectedOrg]);
 
@@ -210,9 +208,6 @@ export default function ClaimsExplorer({ user }) {
       if (newDataset) {
         setDatasets((current) => [...current, {
           ...newDataset,
-          category: newDataset.category || "desynpuf",
-          reporting_period: newDataset.reporting_period || "Historical",
-          synthetic: true,
         }]);
       }
       setDataset(registrationTarget);
@@ -225,6 +220,7 @@ export default function ClaimsExplorer({ user }) {
   }
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const visibleColumns = columns.filter((column) => !isInternalColumn(column));
   const unregisteredDatasets = availableDatasets.filter(
     (item) => !datasets.some((registered) => registered.dataset_identifier === item.dataset_identifier),
   );
@@ -238,18 +234,6 @@ export default function ClaimsExplorer({ user }) {
 
   return (
     <div className="page-stack">
-      <section className="page-intro">
-        <div>
-          <p className="eyebrow">Synthetic Research & Analytics</p>
-          <h2>Claims Explorer</h2>
-          <p className="muted">
-            {isSynthea
-              ? "Synthea synthetic healthcare & EHR dataset. Direct identifiers scrubbed. Read-only."
-              : "Browse CMS DE-SynPUF synthetic Medicare claims (2008–2010). Read-only."}
-          </p>
-        </div>
-      </section>
-
       {error && (
         <div className="data-quality-alert" role="alert">
           <div className="alert-content">
@@ -299,7 +283,8 @@ export default function ClaimsExplorer({ user }) {
               >
                 {datasets.map((item) => (
                   <option key={item.dataset_identifier} value={item.dataset_identifier}>
-                    {item.label} · {item.reporting_period} {item.category === "synthetic_demo" ? "★ Demo" : ""}
+                    {[item.label, item.reporting_period, item.category === "synthetic_demo" ? "Synthetic" : ""]
+                      .filter(Boolean).join(" · ")}
                   </option>
                 ))}
               </select>
@@ -341,34 +326,38 @@ export default function ClaimsExplorer({ user }) {
               <div className="panel" style={{ padding: "16px" }}>
                 <span className="muted" style={{ fontSize: "12px", textTransform: "uppercase" }}>Encounters</span>
                 <div style={{ fontSize: "24px", fontWeight: "700", marginTop: "4px" }}>
-                  {kpis.total_encounters?.toLocaleString() || "5,059"}
+                  {kpis.total_encounters?.toLocaleString() ?? "—"}
                 </div>
                 <span className="muted" style={{ fontSize: "12px" }}>
-                  {kpis.unique_patients || 111} synthetic patients
+                  {kpis.unique_patients?.toLocaleString() ?? "—"} synthetic patients
                 </span>
               </div>
               <div className="panel" style={{ padding: "16px" }}>
                 <span className="muted" style={{ fontSize: "12px", textTransform: "uppercase" }}>Total Claim Cost</span>
                 <div style={{ fontSize: "24px", fontWeight: "700", color: "#166534", marginTop: "4px" }}>
-                  ${(kpis.total_claim_cost || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  {kpis.total_claim_cost == null ? "—" : `$${Number(kpis.total_claim_cost).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
                 </div>
                 <span className="muted" style={{ fontSize: "12px" }}>
-                  Avg: ${(kpis.avg_claim_cost || 0).toFixed(2)} / encounter
+                  Average per encounter: {kpis.avg_claim_cost == null ? "—" : `$${Number(kpis.avg_claim_cost).toFixed(2)}`}
                 </span>
               </div>
               <div className="panel" style={{ padding: "16px" }}>
                 <span className="muted" style={{ fontSize: "12px", textTransform: "uppercase" }}>Providers & Payers</span>
                 <div style={{ fontSize: "24px", fontWeight: "700", marginTop: "4px" }}>
-                  {kpis.unique_providers || 232} / {kpis.unique_payers || 10}
+                  {kpis.unique_providers?.toLocaleString() ?? "—"} / {kpis.unique_payers?.toLocaleString() ?? "—"}
                 </div>
                 <span className="muted" style={{ fontSize: "12px" }}>Active synthetic network</span>
               </div>
               <div className="panel" style={{ padding: "16px" }}>
                 <span className="muted" style={{ fontSize: "12px", textTransform: "uppercase" }}>Service History</span>
                 <div style={{ fontSize: "24px", fontWeight: "700", marginTop: "4px" }}>
-                  1940 – 2026
+                  {kpis.yearly_trends?.length
+                    ? `${kpis.yearly_trends[0].year} – ${kpis.yearly_trends[kpis.yearly_trends.length - 1].year}`
+                    : "—"}
                 </div>
-                <span className="muted" style={{ fontSize: "12px" }}>18 Parquet tables · 178k rows</span>
+                <span className="muted" style={{ fontSize: "12px" }}>
+                  {syntheaSummary?.total_tables?.toLocaleString() ?? "—"} tables · {syntheaSummary?.total_rows?.toLocaleString() ?? "—"} records
+                </span>
               </div>
             </div>
           )}
@@ -400,16 +389,7 @@ export default function ClaimsExplorer({ user }) {
               className={`plan-audit-tab${syntheaTab === "quality" ? " plan-audit-tab--active" : ""}`}
               onClick={() => setSyntheaTab("quality")}
             >
-              Parquet Quality & Reconciliation
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={syntheaTab === "pilot_readiness"}
-              className={`plan-audit-tab${syntheaTab === "pilot_readiness" ? " plan-audit-tab--active" : ""}`}
-              onClick={() => setSyntheaTab("pilot_readiness")}
-            >
-              Phase 4 Pilot Simulation & Boundaries
+              Data quality
             </button>
           </div>
 
@@ -422,7 +402,6 @@ export default function ClaimsExplorer({ user }) {
                   <div className="panel-header">
                     <div>
                       <h3 className="panel-title">Historical Encounter & Spend Trends</h3>
-                      <p className="panel-subtitle">Synthea annual encounter volume and aggregated synthetic costs.</p>
                     </div>
                   </div>
                   <div className="table-wrap">
@@ -478,11 +457,10 @@ export default function ClaimsExplorer({ user }) {
               )}
 
               {/* Top Procedures and Top Medications */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+              <div className="claims-comparison-grid">
                 {kpis?.top_procedures && (
                   <section className="dashboard-panel">
                     <h3 className="panel-title">Top 10 Clinical Procedures</h3>
-                    <p className="panel-subtitle">Coded using SNOMED-CT clinical terminology.</p>
                     <div className="table-wrap" style={{ marginTop: "8px" }}>
                       <table className="executive-table">
                         <thead>
@@ -512,7 +490,6 @@ export default function ClaimsExplorer({ user }) {
                 {kpis?.top_medications && (
                   <section className="dashboard-panel">
                     <h3 className="panel-title">Top 10 Prescribed Medications</h3>
-                    <p className="panel-subtitle">Coded using RxNorm clinical medication concepts.</p>
                     <div className="table-wrap" style={{ marginTop: "8px" }}>
                       <table className="executive-table">
                         <thead>
@@ -547,16 +524,7 @@ export default function ClaimsExplorer({ user }) {
             <div className="page-stack">
               <section className="dashboard-panel">
                 <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginBottom: "12px" }}>
-                  {[
-                    ["encounters", "Encounters (5,059)"],
-                    ["claims", "Claims (8,275)"],
-                    ["procedures", "Procedures (13,641)"],
-                    ["medications", "Medications (3,216)"],
-                    ["claims_transactions", "Transactions (80,981)"],
-                    ["providers", "Providers (267)"],
-                    ["organizations", "Organizations (267)"],
-                    ["patients", "Patients (111)"],
-                  ].map(([key, label]) => (
+                  {(syntheaSummary?.available_subtables || []).map((key) => (
                     <button
                       key={key}
                       type="button"
@@ -568,7 +536,7 @@ export default function ClaimsExplorer({ user }) {
                         setSelectedClaim(null);
                       }}
                     >
-                      {label}
+                      {key.replaceAll("_", " ").split(" ").map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ")}
                     </button>
                   ))}
                 </div>
@@ -615,9 +583,7 @@ export default function ClaimsExplorer({ user }) {
                 <div className="panel-header">
                   <div>
                     <h3 className="panel-title">{subtable.toUpperCase()} Records</h3>
-                    <p className="panel-subtitle">
-                      {loading ? "Querying Parquet via DuckDB…" : `${total.toLocaleString("en-US")} total records · page ${page} of ${totalPages}`}
-                    </p>
+                    <p className="panel-subtitle">{loading ? "Loading…" : `${total.toLocaleString("en-US")} records`}</p>
                   </div>
                   <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
                     <button
@@ -648,7 +614,7 @@ export default function ClaimsExplorer({ user }) {
                     <table className="executive-table">
                       <thead>
                         <tr>
-                          {columns.map((c) => <th key={c}>{c.replace(/_/g, " ")}</th>)}
+                      {visibleColumns.map((c) => <th key={c}>{c.replace(/_/g, " ")}</th>)}
                         </tr>
                       </thead>
                       <tbody>
@@ -662,7 +628,7 @@ export default function ClaimsExplorer({ user }) {
                               onClick={() => setSelectedClaim(selectedClaim === rowId ? null : rowId)}
                               title="Click to view details and linked clinical records"
                             >
-                              {columns.map((c) => (
+                              {visibleColumns.map((c) => (
                                 <td key={c}>
                                   {row[c] == null ? "—" : String(row[c])}
                                 </td>
@@ -678,14 +644,11 @@ export default function ClaimsExplorer({ user }) {
             </div>
           )}
 
-          {/* TAB 3: Parquet Quality & Reconciliation */}
+          {/* TAB 3: Data quality */}
           {syntheaTab === "quality" && (
             <div className="page-stack">
               <section className="dashboard-panel">
-                <h3 className="panel-title">Parquet Quality & Row-Count Reconciliation</h3>
-                <p className="panel-subtitle">
-                  Verification of the 18 converted Synthea tables. Source CSV vs Parquet ZSTD reconciliation status: 100% Match.
-                </p>
+                <h3 className="panel-title">Dataset quality</h3>
                 <div className="table-wrap" style={{ marginTop: "12px" }}>
                   <table className="executive-table">
                     <thead>
@@ -693,9 +656,7 @@ export default function ClaimsExplorer({ user }) {
                         <th>Table</th>
                         <th style={{ textAlign: "right" }}>Rows</th>
                         <th style={{ textAlign: "right" }}>Columns</th>
-                        <th style={{ textAlign: "right" }}>Parquet Size</th>
-                        <th>Status</th>
-                        <th>Privacy / Sanitization</th>
+                        <th style={{ textAlign: "right" }}>File size</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -705,18 +666,6 @@ export default function ClaimsExplorer({ user }) {
                           <td style={{ textAlign: "right" }}>{t.rows.toLocaleString()}</td>
                           <td style={{ textAlign: "right" }}>{t.columns}</td>
                           <td style={{ textAlign: "right" }}>{(t.size_bytes / 1024).toFixed(1)} KB</td>
-                          <td>
-                            <span style={{ color: "#166534", fontWeight: "600" }}>✓ MATCH</span>
-                          </td>
-                          <td>
-                            {t.table === "patients" ? (
-                              <span style={{ color: "#9a3412", fontWeight: "600" }}>
-                                Direct identifiers scrubbed (SSN, name, passport)
-                              </span>
-                            ) : (
-                              <span className="muted">Standard synthetic</span>
-                            )}
-                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -754,100 +703,6 @@ export default function ClaimsExplorer({ user }) {
             </div>
           )}
 
-          {/* TAB 4: Phase 4 Pilot Simulation & Boundaries */}
-          {syntheaTab === "pilot_readiness" && (
-            <div className="page-stack">
-              <section className="dashboard-panel">
-                <h3 className="panel-title">Phase 4 Infusion Audit vs Synthetic Synthea Comparison</h3>
-                <p className="panel-subtitle">
-                  Architectural and data requirement boundaries between synthetic EHR clinical records and genuine Phase 4 employer infusion audits.
-                </p>
-
-                <div className="table-wrap" style={{ marginTop: "1rem" }}>
-                  <table className="executive-table">
-                    <thead>
-                      <tr>
-                        <th>Domain</th>
-                        <th>Synthea Synthetic Demo Dataset</th>
-                        <th>Phase 4 Employer Infusion Claims</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr>
-                        <td><strong>Coding System</strong></td>
-                        <td>
-                          SNOMED-CT for procedures, RxNorm for medications.
-                          <div className="muted" style={{ fontSize: "11px" }}>No Medicare Part B HCPCS J-codes present.</div>
-                        </td>
-                        <td>
-                          HCPCS J-codes (e.g. J9312 rituximab, J0897 denosumab, J1745 infliximab) + NDC crosswalk.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td><strong>Pricing & Adjudication</strong></td>
-                        <td>
-                          Synthetic unadjudicated charges and list costs.
-                          <div className="muted" style={{ fontSize: "11px" }}>No negotiated allowed amounts or coinsurance.</div>
-                        </td>
-                        <td>
-                          Adjudicated allowed amount, plan paid amount, and member cost-share per administered dose.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td><strong>Billing Units</strong></td>
-                        <td>
-                          Procedure count or generic medication units.
-                        </td>
-                        <td>
-                          Strict CMS billing unit conversion (e.g., 10 mg per unit for J9312).
-                        </td>
-                      </tr>
-                      <tr>
-                        <td><strong>Hospital Price Benchmarking</strong></td>
-                        <td>
-                          Synthetic hospital and clinic identities.
-                        </td>
-                        <td>
-                          CMS Hospital Price Transparency rates and Medicare ASP reference benchmarks.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td><strong>Data Privacy Boundary</strong></td>
-                        <td>
-                          Fully synthetic; direct identifiers scrubbed in Parquet.
-                        </td>
-                        <td>
-                          On-premise client-side extractor generates zero-PHI aggregates (<code>claims_summary.csv</code> + <code>manifest.json</code>).
-                        </td>
-                      </tr>
-                      <tr>
-                        <td><strong>Savings Calculation</strong></td>
-                        <td>
-                          <span style={{ color: "#9a3412", fontWeight: "600" }}>
-                            Savings calculations not valid (unadjudicated synthetic data).
-                          </span>
-                        </td>
-                        <td>
-                          <span style={{ color: "#166534", fontWeight: "600" }}>
-                            Valid employer savings against hospital median and ASP + 6%.
-                          </span>
-                        </td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-
-                <div style={{ marginTop: "1.5rem", padding: "16px", background: "var(--bg)", borderRadius: "8px", border: "1px solid var(--line)" }}>
-                  <h4 style={{ margin: "0 0 8px" }}>MeshKor Commercial Integrity Notice</h4>
-                  <p className="muted" style={{ margin: 0, fontSize: "13px", lineHeight: "1.5" }}>
-                    In accordance with MeshKor engineering standards, synthetic data is strictly isolated to Claims Explorer.
-                    Phase 4 Plan Audits require verified aggregate imports from genuine employer/TPA claims processed by the local client extractor.
-                    Savings figures are never fabricated from synthetic EHR data.
-                  </p>
-                </div>
-              </section>
-            </div>
-          )}
         </>
       )}
 
@@ -938,9 +793,7 @@ export default function ClaimsExplorer({ user }) {
             <div className="panel-header">
               <div>
                 <h3 className="panel-title">Results</h3>
-                <p className="panel-subtitle">
-                  {loading ? "Loading…" : `${total.toLocaleString("en-US")} total claims · page ${page} of ${totalPages}`}
-                </p>
+                <p className="panel-subtitle">{loading ? "Loading…" : `${total.toLocaleString("en-US")} claims`}</p>
               </div>
               <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
                 <button
@@ -971,7 +824,7 @@ export default function ClaimsExplorer({ user }) {
                 <table className="executive-table">
                   <thead>
                     <tr>
-                      {columns.map((col) => <th key={col}>{col.replace(/_/g, " ")}</th>)}
+                      {visibleColumns.map((col) => <th key={col}>{col.replace(/_/g, " ")}</th>)}
                     </tr>
                   </thead>
                   <tbody>
@@ -985,7 +838,7 @@ export default function ClaimsExplorer({ user }) {
                         )}
                         title="Click to view claim detail"
                       >
-                        {columns.map((col) => (
+                        {visibleColumns.map((col) => (
                           <td key={col}>
                             {row[col] == null ? "—" : String(row[col])}
                           </td>
@@ -1008,7 +861,6 @@ export default function ClaimsExplorer({ user }) {
           <div className="panel-header">
             <div>
               <h3 className="panel-title">Detail — {selectedClaim}</h3>
-              <p className="panel-subtitle">{isSynthea ? "Synthea record details" : "DE-SynPUF claim header and lines"}</p>
             </div>
             <button type="button" className="secondary" onClick={() => setSelectedClaim(null)}>
               Close Detail
@@ -1033,7 +885,7 @@ export default function ClaimsExplorer({ user }) {
                   <div className="table-wrap">
                     <table className="executive-table">
                       <tbody>
-                        {Object.entries(claimDetail.encounter).map(([k, v]) => (
+                        {Object.entries(claimDetail.encounter).filter(([key]) => !isInternalColumn(key)).map(([k, v]) => (
                           <tr key={k}>
                             <th style={{ textAlign: "left", fontWeight: "600", width: "240px" }}>{k.replace(/_/g, " ")}</th>
                             <td>{v == null ? "—" : String(v)}</td>
@@ -1109,7 +961,7 @@ export default function ClaimsExplorer({ user }) {
                   <div className="table-wrap">
                     <table className="executive-table">
                       <tbody>
-                        {Object.entries(claimDetail.claim).map(([k, v]) => (
+                        {Object.entries(claimDetail.claim).filter(([key]) => !isInternalColumn(key)).map(([k, v]) => (
                           <tr key={k}>
                             <th style={{ textAlign: "left", fontWeight: "600", width: "240px" }}>{k.replace(/_/g, " ")}</th>
                             <td>{v == null ? "—" : String(v)}</td>
@@ -1159,7 +1011,7 @@ export default function ClaimsExplorer({ user }) {
               <div className="table-wrap">
                 <table className="executive-table">
                   <tbody>
-                    {Object.entries(claimDetail.claim || {}).map(([k, v]) => (
+                    {Object.entries(claimDetail.claim || {}).filter(([key]) => !isInternalColumn(key)).map(([k, v]) => (
                       <tr key={k}>
                         <th style={{ textAlign: "left", fontWeight: "600" }}>{k.replace(/_/g, " ")}</th>
                         <td>{v == null ? "—" : String(v)}</td>
@@ -1176,7 +1028,7 @@ export default function ClaimsExplorer({ user }) {
                     <table className="executive-table">
                       <thead>
                         <tr>
-                          {Object.keys(claimDetail.lines[0]).map((col) => (
+                          {Object.keys(claimDetail.lines[0]).filter((col) => !isInternalColumn(col)).map((col) => (
                             <th key={col}>{col.replace(/_/g, " ")}</th>
                           ))}
                         </tr>
@@ -1184,8 +1036,8 @@ export default function ClaimsExplorer({ user }) {
                       <tbody>
                         {claimDetail.lines.map((line, i) => (
                           <tr key={line.line_id || i}>
-                            {Object.values(line).map((v, j) => (
-                              <td key={j}>{v == null ? "—" : String(v)}</td>
+                            {Object.entries(line).filter(([key]) => !isInternalColumn(key)).map(([key, value]) => (
+                              <td key={key}>{value == null ? "—" : String(value)}</td>
                             ))}
                           </tr>
                         ))}

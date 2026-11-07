@@ -5,15 +5,12 @@ export default function Quality() {
   const q = useApi("hospital-file-quality");
   return (
     <section>
-      <h1>Data quality by file</h1>
-      <p className="lede">What the parser found in each hospital file. A file with 0 drug rows
-        either has none of the drugs in scope or uses a layout the parser does not read yet.</p>
+      <p className="lede">Review parsed hospital file coverage and errors.</p>
       <Loading state={q}>
         {(rows) => (
           <Table rows={rows} columns={[
             { key: "system", label: "System" },
-            { key: "hospital_name", label: "Hospital",
-              render: (r) => <>{r.hospital_name || "—"}<div className="muted mono">{r.source_member}</div></> },
+            { key: "hospital_name", label: "Hospital" },
             { key: "format", label: "Format" },
             { key: "cms_version", label: "CMS ver." },
             { key: "file_last_updated", label: "File date" },

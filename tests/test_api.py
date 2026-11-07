@@ -654,6 +654,8 @@ def test_viewer_cannot_read_source_inventory_or_job_logs(built, db):
 
 
 def test_refresh_job_starts_worker_automatically(client, monkeypatch):
+    from contextlib import contextmanager
+    import pipeline.snapshots
     import pricing.views
 
     calls = []
@@ -663,6 +665,101 @@ def test_refresh_job_starts_worker_automatically(client, monkeypatch):
     assert response.status_code == 202, response.json()
     assert response.json()["status"] == "queued"
     assert calls and calls[0][0][0][2:] == ["process_jobs", "--once"]
+    @contextmanager
+    def active_worker_lock(_project, *, blocking=True):
+        yield False
+
+    monkeypatch.setattr(pipeline.snapshots, "pipeline_mutex", active_worker_lock)
+    duplicate = client.post("/api/v1/sources/jobs/", {"job_type": "market_report"},
+                            content_type="application/json")
+    assert duplicate.status_code == 409
+    assert len(calls) == 1
+
+
+def test_stale_processing_job_restarts_only_when_pipeline_lock_is_free(client, monkeypatch):
+    from contextlib import contextmanager
+    import pipeline.snapshots
+    import pricing.views
+    from django.utils import timezone
+    from pricing.models import ProcessingJob
+
+    job = ProcessingJob.objects.create(job_type="refresh_data", status="running",
+                                       started_at=timezone.now())
+    calls = []
+    monkeypatch.setattr(pricing.views.subprocess, "Popen",
+                        lambda *args, **kwargs: calls.append((args, kwargs)))
+    state = {"available": False}
+
+    @contextmanager
+    def fake_pipeline_mutex(_project, *, blocking=True):
+        assert blocking is False
+        yield state["available"]
+
+    monkeypatch.setattr(pipeline.snapshots, "pipeline_mutex", fake_pipeline_mutex)
+    path = "/api/v1/sources/jobs/"
+    payload = {"job_type": "refresh_data"}
+    busy = client.post(path, payload, content_type="application/json")
+    assert busy.status_code == 409
+    assert busy.json()["id"] == job.pk
+    assert calls == []
+
+    state["available"] = True
+    recovered = client.post(path, payload, content_type="application/json")
+    assert recovered.status_code == 202
+    assert recovered.json()["id"] == job.pk
+    assert recovered.json()["recovery_scheduled"] is True
+    assert len(calls) == 1
+    assert ProcessingJob.objects.count() == 1
+
+
+def test_plan_audit_hospital_and_asp_lists_are_paged(client, monkeypatch):
+    from decimal import Decimal
+    from types import SimpleNamespace
+    import pricing.plan_audit_run as audit_run
+
+    rows = [SimpleNamespace(
+        hcpcs_code="J9271", site_npi=f"{index:010d}", quarter="2026Q1",
+        service_setting="outpatient", plan_allowed_price_per_unit=Decimal("100"),
+        hospital_price_per_unit=Decimal("125"), hospital_markup_multiple=Decimal("1.25"),
+        plan_to_hospital_price_multiple=Decimal("0.8"), data_quality_status="VALID",
+        source_references={}, plan_paid_price_per_unit=Decimal("90"),
+        asp_payment_limit=Decimal("80"), allowed_markup_multiple=Decimal("1.25"),
+        paid_markup_multiple=Decimal("1.125"),
+    ) for index in range(2005)]
+
+    class QueryRows:
+        def __init__(self, items):
+            self.items = items
+
+        def exclude(self, **_kwargs):
+            return self
+
+        def order_by(self, *_fields):
+            return self
+
+        def count(self):
+            return len(self.items)
+
+        def __getitem__(self, selection):
+            return self.items[selection]
+
+    monkeypatch.setattr(audit_run, "get_visible_audit", lambda *_args: object())
+    monkeypatch.setattr(audit_run, "current_audit_run", lambda *_args: object())
+    monkeypatch.setattr(audit_run, "run_results", lambda *_args: QueryRows(rows))
+
+    for endpoint in ("hospital-comparison", "asp-benchmark"):
+        first_page = client.get(f"/api/v1/plan-audits/1/{endpoint}/?limit=200&offset=0")
+        assert first_page.status_code == 200
+        assert first_page.json()["count"] == 2005
+        assert len(first_page.json()["results"]) == 200
+        assert first_page.json()["next_offset"] == 200
+        assert first_page.json()["previous_offset"] is None
+
+        last_page = client.get(f"/api/v1/plan-audits/1/{endpoint}/?limit=200&offset=2000")
+        assert last_page.status_code == 200
+        assert len(last_page.json()["results"]) == 5
+        assert last_page.json()["next_offset"] is None
+        assert last_page.json()["previous_offset"] == 1800
 
 
 def test_saved_comparison_is_available_as_archived_snapshot_when_source_is_missing(built):

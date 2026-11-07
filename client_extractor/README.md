@@ -47,6 +47,6 @@ CSV, XLSX, and XLSM exports are supported. The 837P/837I adapter deliberately re
 
 - `output/claims_summary.csv`: approved central-import schema only.
 - `output/manifest.json`: aggregate CSV SHA-256, schema version, row count, privacy/suppression declarations, and non-identifying source provenance.
-- `output/data_quality.json`: local-only row numbers and reasons; keep it inside the client environment.
+- `output/data_quality.json`: local-only row numbers, claim-record exclusion counts/reasons, and separate suppressed/rejected aggregate-cell counts/reasons; keep it inside the client environment. `excluded_records` counts input claims only. `excluded_aggregate_cells` counts aggregate groups omitted from export, including privacy-suppressed cells and cells rejected for schema precision. These units are separate and must not be added together as a claim total.
 
 This tool is a privacy control, not a legal or compliance certification. The employer/TPA must review adjudication, suppression, and data-governance rules before use.

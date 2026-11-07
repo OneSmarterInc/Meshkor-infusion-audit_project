@@ -1,12 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { csvUrl, fmt, getJSON, PRICE_TYPE_TEXT, STATUS_TEXT } from "../api.js";
+import { downloadFile, fmt, getJSON, PRICE_TYPE_TEXT, STATUS_TEXT } from "../api.js";
 import { StatusPill } from "../components.jsx";
 
 const PAGE = 50;
 /** Server-side filtered, sorted, paged rate table with CSV export. */
 export default function RatesTable({ fixed = {}, user }) {
-  const isAdmin = user?.roles?.some((role) => ["SUPER_ADMIN", "Admin"].includes(role));
   const canReviewAllStatuses = user?.roles?.some((role) => ["SUPER_ADMIN", "ANALYST", "Admin"].includes(role));
   const [payerGroups, setPayerGroups] = useState([]);
   const [searchParams] = useSearchParams();
@@ -14,6 +13,8 @@ export default function RatesTable({ fixed = {}, user }) {
   const [sort, setSort] = useState({ sort: "markup_multiple", order: "desc" });
   const [offset, setOffset] = useState(0);
   const [res, setRes] = useState({ rows: [], total: 0, error: null, loading: true });
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
   const params = { ...fixed, ...f, ...sort };
   const key = JSON.stringify(params);
 
@@ -39,6 +40,21 @@ export default function RatesTable({ fixed = {}, user }) {
   }, [key, offset]);
 
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const exportCsv = async () => {
+    const query = new URLSearchParams(Object.fromEntries(
+      Object.entries({ ...fixed, ...f }).filter(([, value]) => value !== "" && value != null),
+    )).toString();
+    setExporting(true);
+    setExportError("");
+    try {
+      await downloadFile(`hospital-drug-price-comparisons/exports/csv/?${query}`,
+        "infusion_audit_report_appendix.csv");
+    } catch (error) {
+      setExportError(error.message || "CSV export failed.");
+    } finally {
+      setExporting(false);
+    }
+  };
   const th = (k, label, num) => (
     <th className={num ? "num" : ""} onClick={() => setSort({ sort: k,
       order: sort.sort === k && sort.order === "desc" ? "asc" : "desc" })}>
@@ -63,8 +79,11 @@ export default function RatesTable({ fixed = {}, user }) {
         </select>
         <input placeholder="Search hospital, payer, plan, description" value={f.q}
           onChange={set("q")} />
-        <a className="button" href={csvUrl({ ...fixed, ...f })}>Export CSV</a>
+        <button className="button" type="button" onClick={exportCsv} disabled={exporting}>
+          {exporting ? "Exporting…" : "Export CSV"}
+        </button>
       </div>
+      {exportError && <div className="note error" role="alert">{exportError}</div>}
       {res.error && <div className="note error">{res.error.message}</div>}
       <div className="table-wrap">
         <table>
@@ -88,7 +107,7 @@ export default function RatesTable({ fixed = {}, user }) {
           </thead>
           <tbody>
             {res.rows.map((r, i) => (
-              <tr key={i} title={isAdmin ? `${r.source_file || ""} :: ${r.source_member || ""}`.trim() : undefined}>
+              <tr key={i}>
                 <td><Link to={`/hospitals/${r.hospital_key}`}>{r.hospital_label}</Link>
                   <div className="muted">{r.setting || ""}</div></td>
                 {!fixed.hcpcs && <td><Link to={`/drugs/${r.hcpcs}`}>{r.hcpcs}</Link>
