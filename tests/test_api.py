@@ -261,9 +261,16 @@ def test_four_role_backend_permission_matrix():
     client_plan_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/plan-audits/")
     client_market_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/hospitals/")
     client_claims_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/claims/")
+    client_imports_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/plan-audits/imports/")
+    client_org_users_request = SimpleNamespace(user=client_user, method="GET", path="/api/v1/organizations/1/users/")
+    client_published_results_request = SimpleNamespace(
+        user=client_user, method="GET", path="/api/v1/plan-audits/1/results/")
     assert CanView().has_permission(client_plan_request, None)
     assert CanView().has_permission(client_market_request, None)
     assert not CanView().has_permission(client_claims_request, None)
+    assert not CanView().has_permission(client_imports_request, None)
+    assert not CanView().has_permission(client_org_users_request, None)
+    assert CanView().has_permission(client_published_results_request, None)
 
 
 @pytest.mark.django_db
@@ -887,6 +894,17 @@ def test_claims_explorer_organization_scoping_and_privacy(client, db):
         "dataset_identifier": "desynpuf_inpatient_claims_sample_1",
     }, content_type="application/json")
     assert unauthorized_registration.status_code == 403
+
+    reviewer_group, _ = Group.objects.get_or_create(name="REVIEWER")
+    reviewer_user = get_user_model().objects.create_user(username="claims-reviewer", password="test-password")
+    reviewer_user.groups.add(reviewer_group)
+    PlanOrganizationAccess.objects.create(organization=org1, user=reviewer_user)
+    reviewer_client = DjangoClient()
+    mfa_force_login(reviewer_client, reviewer_user)
+    assert reviewer_client.get("/api/v1/claims/datasets/", {"organization_id": org1.pk}).status_code == 403
+    assert reviewer_client.get("/api/v1/claims/", {
+        "organization_id": org1.pk, "dataset": "desynpuf_outpatient_claims_sample_1",
+    }).status_code == 403
 
     dataset_id = "desynpuf_outpatient_claims_sample_1"
     ClaimsExplorerDataset.objects.create(

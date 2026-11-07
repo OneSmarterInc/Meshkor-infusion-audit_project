@@ -2,6 +2,7 @@ import React, { lazy, Suspense, useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { QRCodeSVG } from "qrcode.react";
+import { canAccess, hasRole, isClientOnly } from "./rolePolicy.js";
 
 import { completeOtpLogin, confirmOtpEnrollment, getJSON, login, logout, restoreLogin, startOtpEnrollment } from "./api.js";
 import "./styles.css";
@@ -23,6 +24,7 @@ const Settings = lazy(() => import("./pages/Settings.jsx"));
 const UserManagement = lazy(() => import("./pages/UserManagement.jsx"));
 const PlanAudits = lazy(() => import("./pages/PlanAudits.jsx"));
 const ClaimsExplorer = lazy(() => import("./pages/ClaimsExplorer.jsx"));
+const ClientPlanAudits = lazy(() => import("./pages/ClientPlanAudits.jsx"));
 
 function Landing({ onLogin }) {
   const [username, setUsername] = useState("");
@@ -172,18 +174,14 @@ function LegacyDrugRedirect() {
   return <Navigate to={`/medicare-part-b-drugs/${encodeURIComponent(hcpcs)}`} replace />;
 }
 
-function AdminOnly({ user, children }) {
-  return user?.roles?.some((role) => ["SUPER_ADMIN", "Admin"].includes(role)) ? children : <Navigate to="/" replace />;
+function AccessDenied() {
+  return <section className="note" role="alert"><h2>Access denied</h2>
+    <p>Your account does not have permission to open this workspace.</p><NavLink to="/">Return to your dashboard</NavLink>
+  </section>;
 }
 
-function AnalystOrAdmin({ user, children }) {
-  return user?.roles?.some((role) => ["SUPER_ADMIN", "ANALYST", "Admin"].includes(role))
-    ? children : <Navigate to="/" replace />;
-}
-
-function ReviewerOrAdmin({ user, children }) {
-  return user?.roles?.some((role) => ["SUPER_ADMIN", "REVIEWER", "Admin"].includes(role))
-    ? children : <Navigate to="/" replace />;
+function RequirePolicy({ user, policy, children }) {
+  return canAccess(user, policy) ? children : <AccessDenied />;
 }
 
 function Shell({ user, onLogout }) {
@@ -203,31 +201,33 @@ function Shell({ user, onLogout }) {
         <div className="brand"><span className="mark">MK</span>{!collapsed && <div><div className="title">MeshKor</div><div className="sub">Healthcare analytics</div></div>}</div>
         <div className="sidebar-group"><span className="sidebar-label">AUDIT PLATFORM</span><nav aria-label="Main navigation">
           <NavLink to="/" end><span>◫</span>{!collapsed && "Overview"}</NavLink>
-          <NavLink to="/hospitals"><span>⌂</span>{!collapsed && "Hospitals"}</NavLink>
-          {user.roles?.some((role) => ["SUPER_ADMIN", "ANALYST", "Admin"].includes(role)) && <NavLink to="/drug-selection-scope"><span>#</span>{!collapsed && "Drug Scope"}</NavLink>}
-          <NavLink to="/hospital-drug-price-comparisons"><span>↗</span>{!collapsed && "Comparisons"}</NavLink>
-          <NavLink to="/plan-specific-audits"><span>◉</span>{!collapsed && "Plan Audits"}</NavLink>
-          <NavLink to="/claims-explorer"><span>▦</span>{!collapsed && "Claims Explorer"}</NavLink>
-          <NavLink to="/reports"><span>▧</span>{!collapsed && "Reports"}</NavLink>
+          {canAccess(user, "market") && <NavLink to="/hospitals"><span>⌂</span>{!collapsed && "Hospitals"}</NavLink>}
+          {canAccess(user, "drugScope") && <NavLink to="/drug-selection-scope"><span>#</span>{!collapsed && "Drug Scope"}</NavLink>}
+          {canAccess(user, "market") && <NavLink to="/hospital-drug-price-comparisons"><span>↗</span>{!collapsed && "Comparisons"}</NavLink>}
+          {canAccess(user, "planAudits") && <NavLink to="/plan-specific-audits"><span>◉</span>{!collapsed && (hasRole(user, "REVIEWER") && !hasRole(user, "ANALYST", "SUPER_ADMIN") ? "Review Queue" : "Plan Audits")}</NavLink>}
+          {canAccess(user, "claims") && <NavLink to="/claims-explorer"><span>▦</span>{!collapsed && "Claims Explorer"}</NavLink>}
+          {canAccess(user, "market") && <NavLink to="/reports"><span>▧</span>{!collapsed && "Reports"}</NavLink>}
           <details className="sidebar-more">
             <summary><span>•••</span>{!collapsed && "More"}</summary>
             <div className="sidebar-subnav">
               <NavLink to="/methodology">Methodology</NavLink>
-              {user.roles?.some((role) => ["SUPER_ADMIN", "ANALYST", "Admin"].includes(role)) && <>
+              {canAccess(user, "admin") && <>
                 <NavLink to="/hospital-price-transparency-files">Hospital Price Files</NavLink>
                 <NavLink to="/reference-data-sets">Reference Data Sets</NavLink>
                 <NavLink to="/hospital-file-quality">Hospital File Quality</NavLink>
+              </>}
+              {canAccess(user, "analyst") && <>
                 <NavLink to="/data-sources">Data Sources & Import</NavLink>
-                <NavLink to="/claims-explorer">Claims Explorer</NavLink>
               </>}
-              {user.roles?.some((role) => ["SUPER_ADMIN", "REVIEWER", "Admin"].includes(role)) && <>
-                <NavLink to="/drug-unit-validations">Drug Unit Review</NavLink>
+              {canAccess(user, "reviewer") && <>
+                <NavLink to="/drug-selection-scope">Drug Scope</NavLink>
+                <NavLink to="/drug-unit-validations">{hasRole(user, "REVIEWER") ? "Review Queue · Drug Units" : "Drug Unit Review"}</NavLink>
               </>}
-              {user.roles?.some((role) => ["SUPER_ADMIN", "Admin"].includes(role)) && <>
+              {canAccess(user, "admin") && <>
                 <NavLink to="/audit-logs">Audit Logs</NavLink>
                 <NavLink to="/user-management">User Management</NavLink>
               </>}
-              <NavLink to="/application-settings">Application Settings</NavLink>
+              <NavLink to="/application-settings">{canAccess(user, "admin") ? "Application Settings" : "Account Security"}</NavLink>
             </div>
           </details>
         </nav></div>
@@ -243,22 +243,22 @@ function Shell({ user, onLogout }) {
         <Suspense fallback={<div className="auth-loading" role="status">Loading page…</div>}>
         <Routes>
           <Route path="/" element={<Overview user={user} />} />
-          <Route path="/reference-data-sets" element={<AdminOnly user={user}><ReferenceData /></AdminOnly>} />
-          <Route path="/hospital-price-transparency-files" element={<AdminOnly user={user}><HospitalFiles /></AdminOnly>} />
+          <Route path="/reference-data-sets" element={<RequirePolicy user={user} policy="admin"><ReferenceData /></RequirePolicy>} />
+          <Route path="/hospital-price-transparency-files" element={<RequirePolicy user={user} policy="admin"><HospitalFiles /></RequirePolicy>} />
           <Route path="/medicare-part-b-drugs/:hcpcs" element={<DrugDetail user={user} />} />
           <Route path="/hospitals" element={<Hospitals user={user} />} />
           <Route path="/hospitals/:key" element={<HospitalDetail user={user} />} />
-          <Route path="/drug-selection-scope" element={<AnalystOrAdmin user={user}><DrugScope user={user} /></AnalystOrAdmin>} />
-          <Route path="/drug-unit-validations" element={<ReviewerOrAdmin user={user}><UnitValidation user={user} /></ReviewerOrAdmin>} />
+          <Route path="/drug-selection-scope" element={<RequirePolicy user={user} policy="drugScope"><DrugScope user={user} /></RequirePolicy>} />
+          <Route path="/drug-unit-validations" element={<RequirePolicy user={user} policy="reviewer"><UnitValidation user={user} /></RequirePolicy>} />
           <Route path="/hospital-drug-price-comparisons" element={<Rates user={user} />} />
-          <Route path="/hospital-file-quality" element={<AdminOnly user={user}><Quality /></AdminOnly>} />
-          <Route path="/data-sources" element={<AnalystOrAdmin user={user}><Sources user={user} /></AnalystOrAdmin>} />
+          <Route path="/hospital-file-quality" element={<RequirePolicy user={user} policy="admin"><Quality /></RequirePolicy>} />
+          <Route path="/data-sources" element={<RequirePolicy user={user} policy="analyst"><Sources user={user} /></RequirePolicy>} />
           <Route path="/reports" element={<Reports user={user} />} />
-          <Route path="/plan-specific-audits" element={<PlanAudits user={user} />} />
-          <Route path="/claims-explorer" element={<ClaimsExplorer user={user} />} />
-          <Route path="/claims" element={<Navigate to="/claims-explorer" replace />} />
-          <Route path="/audit-logs" element={<AdminOnly user={user}><AuditLogs /></AdminOnly>} />
-          <Route path="/user-management" element={<AdminOnly user={user}><UserManagement user={user} /></AdminOnly>} />
+          <Route path="/plan-specific-audits" element={<RequirePolicy user={user} policy="planAudits">{isClientOnly(user) ? <ClientPlanAudits /> : <PlanAudits user={user} />}</RequirePolicy>} />
+          <Route path="/claims-explorer" element={<RequirePolicy user={user} policy="claims"><ClaimsExplorer user={user} /></RequirePolicy>} />
+          <Route path="/claims" element={<RequirePolicy user={user} policy="claims"><Navigate to="/claims-explorer" replace /></RequirePolicy>} />
+          <Route path="/audit-logs" element={<RequirePolicy user={user} policy="admin"><AuditLogs /></RequirePolicy>} />
+          <Route path="/user-management" element={<RequirePolicy user={user} policy="admin"><UserManagement user={user} /></RequirePolicy>} />
           <Route path="/application-settings" element={<Settings user={user} />} />
           <Route path="/methodology" element={<Method />} />
           <Route path="/reference" element={<Navigate to="/reference-data-sets" replace />} />

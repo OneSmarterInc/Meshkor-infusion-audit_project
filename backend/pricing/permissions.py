@@ -1,3 +1,5 @@
+import re
+
 from rest_framework.permissions import BasePermission
 
 
@@ -43,6 +45,31 @@ def _log_read(request):
     )
 
 
+def _client_get_route_allowed(path):
+    """Allow only client-facing organization, plan, published-audit, and market reads."""
+    route = path
+    for prefix in ("/api/v1", "/api"):
+        if route.startswith(prefix + "/"):
+            route = route[len(prefix):]
+            break
+    if route == "/organizations/" or route == "/plans/":
+        return True
+    if re.fullmatch(r"/plans/\d+/", route):
+        return True
+    if route == "/plan-audits/" or re.fullmatch(r"/plan-audits/\d+/", route):
+        return True
+    if re.fullmatch(
+            r"/plan-audits/\d+/(overview|results|historical-spending|drug-analysis|"
+            r"hospital-comparison|asp-benchmark|savings|network-validation|quality|report|export-csv|review)/",
+            route):
+        return True
+    released_market_routes = (
+        "/dashboard/summary/", "/dashboard/price-trends/", "/medicare-part-b-drugs/",
+        "/hospitals/", "/hospital-drug-price-comparisons/", "/reports/",
+    )
+    return any(route.startswith(prefix) for prefix in released_market_routes)
+
+
 class CanView(BasePermission):
     message = "Sign in with an authorized application account."
 
@@ -51,20 +78,7 @@ class CanView(BasePermission):
         if (allowed and not request.user.is_superuser
                 and has_any_role(request.user, {CLIENT_GROUP, VIEWER_GROUP})
                 and not has_any_role(request.user, {SUPER_ADMIN_GROUP, ADMIN_GROUP, ANALYST_GROUP, REVIEWER_GROUP})):
-            path = request.path.rstrip("/") + "/"
-            client_routes = ("/organizations/", "/plans/", "/plan-audits/")
-            released_market_routes = (
-                "/api/v1/dashboard/summary/",
-                "/api/v1/dashboard/price-trends/",
-                "/api/v1/medicare-part-b-drugs/",
-                "/api/v1/hospitals/",
-                "/api/v1/hospital-drug-price-comparisons/",
-                "/api/v1/reports/",
-            )
-            allowed = request.method == "GET" and (
-                any(route in path for route in client_routes)
-                or any(path.startswith(route) for route in released_market_routes)
-            )
+            allowed = request.method == "GET" and _client_get_route_allowed(request.path)
         if allowed:
             _log_read(request)
         return allowed

@@ -247,6 +247,9 @@ def export_plan_csv(request, audit_id):
 @api_view(["GET", "POST"])
 @permission_classes([CanView])
 def audit_review(request, audit_id):
+    if request.method == "GET" and is_client_only(request.user):
+        from django.http import Http404
+        raise Http404
     if request.method == "POST" and not has_any_role(request.user, {SUPER_ADMIN_GROUP, REVIEWER_GROUP}):
         return Response({"error": "Only a Reviewer or Super Admin can submit a formal review."}, status=403)
     audit = get_visible_audit(request.user, audit_id)
