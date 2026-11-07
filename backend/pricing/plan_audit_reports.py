@@ -27,8 +27,8 @@ def _admin_required(request):
     return None
 
 
-def _savings_payload(item):
-    return {
+def _savings_payload(item, *, include_source_references=True):
+    payload = {
         "id": item.pk, "hcpcs_code": item.hcpcs_code, "quarter": item.quarter,
         "service_setting": item.service_setting, "current_site_npi": item.current_site_npi,
         "alternative_site_npi": item.alternative_site_npi,
@@ -40,9 +40,11 @@ def _savings_payload(item):
         "network_status": item.network_status,
         "clinical_review_status": item.clinical_review_status,
         "validation_status": item.validation_status,
-        "source_references": item.source_references,
         "label": "Potential allowed-amount savings; clinical review pending.",
     }
+    if include_source_references:
+        payload["source_references"] = item.source_references
+    return payload
 
 
 def _paged_response(request, queryset, serialize, *, default_limit=200, max_limit=500):
@@ -67,7 +69,10 @@ def audit_savings(request, audit_id):
     rows = run_opportunities(current_audit_run(audit))
     if is_client_only(request.user):
         rows = rows.filter(validation_status="validated", clinical_review_status__in=("approved", "validated"))
-    return _paged_response(request, rows.order_by("pk"), _savings_payload)
+    return _paged_response(
+        request, rows.order_by("pk"),
+        lambda row: _savings_payload(row, include_source_references=not is_client_only(request.user)),
+    )
 
 
 @api_view(["GET"])
@@ -76,12 +81,14 @@ def audit_network_validation(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
     rows = run_results(current_audit_run(audit)).order_by("site_npi", "quarter", "hcpcs_code")
     def serialize(row):
-        return {
+        payload = {
         "site_npi": row.site_npi, "quarter": row.quarter,
         "data_network_status": row.network_status,
         "hcpcs_code": row.hcpcs_code, "service_setting": row.service_setting,
-        "source_references": row.source_references,
-    }
+        }
+        if not is_client_only(request.user):
+            payload["source_references"] = row.source_references
+        return payload
     return _paged_response(request, rows, serialize)
 
 
@@ -94,9 +101,8 @@ def audit_quality(request, audit_id):
     result_count = results.count()
     asp_count = results.filter(asp_payment_limit__isnull=False).count()
     hospital_count = results.filter(hospital_price_per_unit__isnull=False).count()
-    return Response({
+    response = {
         "audit_id": audit.pk, "status": audit.status,
-        "import_quality": audit.summary_import.validation_summary,
         "result_status_counts": dict(statuses),
         "benchmark_availability": {
             "result_rows": result_count,
@@ -113,7 +119,10 @@ def audit_quality(request, audit_id):
             "Summary metrics include only visible approved aggregate rows.",
         ] + (["Potential savings are unavailable because no evidence-backed lower-priced full-quarter in-network alternative was identified."]
              if not run_opportunities(current_audit_run(audit)).exists() else []),
-    })
+    }
+    if not is_client_only(request.user):
+        response["import_quality"] = audit.summary_import.validation_summary
+    return Response(response)
 
 
 @api_view(["POST"])
@@ -194,13 +203,15 @@ def _build_pdf(audit, run):
     return buffer.getvalue()
 
 
-def _build_csv(run):
+def _build_csv(run, *, include_source_references=True):
     output = io.StringIO(newline="")
     fields = ["audit_version", "result_fingerprint", "hcpcs_code", "site_npi", "quarter", "service_setting",
         "total_units", "total_allowed_amount", "total_paid_amount", "member_count_band",
         "plan_allowed_price_per_unit", "plan_paid_price_per_unit", "hospital_price_per_unit",
         "asp_payment_limit", "hospital_markup_multiple", "allowed_markup_multiple", "paid_markup_multiple",
-        "plan_to_hospital_price_multiple", "network_status", "data_quality_status", "data_quality_notes", "source_references"]
+        "plan_to_hospital_price_multiple", "network_status", "data_quality_status", "data_quality_notes"]
+    if include_source_references:
+        fields.append("source_references")
     writer = csv.DictWriter(output, fieldnames=fields); writer.writeheader()
     for row in run_results(run):
         data = {"audit_version": run.version, "result_fingerprint": run.result_fingerprint,
@@ -212,8 +223,10 @@ def _build_csv(run):
             "asp_payment_limit": _decimal_text(row.asp_payment_limit), "hospital_markup_multiple": _decimal_text(row.hospital_markup_multiple),
             "allowed_markup_multiple": _decimal_text(row.allowed_markup_multiple), "paid_markup_multiple": _decimal_text(row.paid_markup_multiple),
             "plan_to_hospital_price_multiple": _decimal_text(row.plan_to_hospital_price_multiple), "network_status": row.network_status,
-            "data_quality_status": row.data_quality_status, "data_quality_notes": "; ".join(row.data_quality_notes),
-            "source_references": json.dumps(row.source_references, sort_keys=True, separators=(",", ":"))}
+            "data_quality_status": row.data_quality_status, "data_quality_notes": "; ".join(row.data_quality_notes)}
+        if include_source_references:
+            data["source_references"] = json.dumps(
+                row.source_references, sort_keys=True, separators=(",", ":"))
         writer.writerow({key: csv_safe_cell(value) for key, value in data.items()})
     return ("\ufeff" + output.getvalue()).encode("utf-8")
 
@@ -239,7 +252,9 @@ def export_plan_csv(request, audit_id):
     artifact = run.artifacts.filter(artifact_type="csv").first() if run else None
     if not artifact or hashlib.sha256(bytes(artifact.content)).hexdigest() != artifact.sha256:
         return Response({"error": "A verified CSV artifact is not available for this audit version."}, status=404)
-    response = HttpResponse(bytes(artifact.content), content_type="text/csv; charset=utf-8")
+    content = (_build_csv(run, include_source_references=False)
+               if is_client_only(request.user) else bytes(artifact.content))
+    response = HttpResponse(content, content_type="text/csv; charset=utf-8")
     response["Content-Disposition"] = f'attachment; filename="plan-audit-{audit.pk}-v{run.version}-results.csv"'
     return response
 

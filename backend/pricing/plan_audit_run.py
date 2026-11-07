@@ -229,8 +229,12 @@ def audit_results(request, audit_id):
         queryset = queryset.filter(data_quality_status=request.query_params["data_quality_status"])
     total = queryset.count()
     rows = queryset[offset:offset + limit]
+    serialized = [result_payload(row) for row in rows]
+    if is_client_only(request.user):
+        for item in serialized:
+            item.pop("source_references", None)
     return Response({"count": total, "limit": limit, "offset": offset,
-                     "results": [result_payload(row) for row in rows]})
+                     "results": serialized})
 
 
 @api_view(["GET"])
@@ -444,7 +448,7 @@ def drug_analysis(request, audit_id):
 def hospital_comparison(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
     rows = run_results(current_audit_run(audit)).exclude(hospital_price_per_unit__isnull=True)
-    return Response([{
+    response = [{
         "hcpcs_code": row.hcpcs_code, "site_npi": row.site_npi,
         "quarter": row.quarter, "service_setting": row.service_setting,
         "plan_allowed_price_per_unit": _decimal_text(row.plan_allowed_price_per_unit),
@@ -452,9 +456,10 @@ def hospital_comparison(request, audit_id):
         "hospital_markup_multiple": _decimal_text(row.hospital_markup_multiple),
         "plan_to_hospital_price_multiple": _decimal_text(row.plan_to_hospital_price_multiple),
         "data_quality_status": row.data_quality_status,
-        "source_references": row.source_references,
         "interpretation": "Hospital-reported reference price; not the employer plan's contracted rate.",
-    } for row in rows[:2000]])
+        **({} if is_client_only(request.user) else {"source_references": row.source_references}),
+    } for row in rows[:2000]]
+    return Response(response)
 
 
 @api_view(["GET"])
@@ -462,7 +467,7 @@ def hospital_comparison(request, audit_id):
 def asp_benchmark(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
     rows = run_results(current_audit_run(audit)).order_by("hcpcs_code", "quarter", "site_npi")
-    return Response([{
+    response = [{
         "hcpcs_code": row.hcpcs_code, "site_npi": row.site_npi,
         "quarter": row.quarter, "plan_allowed_price_per_unit": _decimal_text(row.plan_allowed_price_per_unit),
         "plan_paid_price_per_unit": _decimal_text(row.plan_paid_price_per_unit),
@@ -470,8 +475,9 @@ def asp_benchmark(request, audit_id):
         "allowed_markup_multiple": _decimal_text(row.allowed_markup_multiple),
         "paid_markup_multiple": _decimal_text(row.paid_markup_multiple),
         "data_quality_status": row.data_quality_status,
-        "source_references": row.source_references,
-    } for row in rows[:2000]])
+        **({} if is_client_only(request.user) else {"source_references": row.source_references}),
+    } for row in rows[:2000]]
+    return Response(response)
 
 
 @api_view(["GET"])

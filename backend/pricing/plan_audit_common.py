@@ -168,7 +168,8 @@ def audit_payload(item, user=None):
     payload = {
         "id": item.pk, "organization_id": item.organization_id,
         "organization_name": item.organization.organization_name, "plan_id": item.plan_id,
-        "plan_name": item.plan.plan_name, "summary_import_id": item.summary_import_id,
+        "plan_name": item.plan.plan_name,
+        "summary_import_id": item.summary_import_id if not client else None,
         "audit_name": item.audit_name, "reporting_period": item.reporting_period,
         "status": item.status, "created_by": item.created_by.get_username() if item.created_by_id else None,
         "created_by_id": item.created_by_id if not client else None,

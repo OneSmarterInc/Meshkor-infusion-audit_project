@@ -1270,3 +1270,187 @@ Multiple roles combine their explicitly granted capabilities. Legacy `Admin` map
 - No commit, push, or deployment was made.
 
 **Acceptance:** Role access **PASS**; dashboards **PASS**; backend RBAC **PASS**; full non-browser regression **140 passed**; frontend role tests **4 passed**; Django/migration checks **PASS**; frontend build **PASS**. **PHASE 1: VERIFIED.**
+
+---
+
+## PHASE 2 — BUSINESS WORKFLOW AND BACKEND INTEGRATION
+
+**Date:** 2026-11-07
+**Result:** **PHASE 2 BLOCKED BY APPROVAL**. Existing workflows and the real calculation path are verified, but the checked-out audit cannot pass the clinical unit-review gate using genuine review evidence. The publication-state mechanics are covered by isolated tests; a test fixture that injects a validated marker and a savings row is not clinical/business signoff and is not counted as a valid publication acceptance.
+
+### Completeness inventory
+
+| Workflow | Classification | Existing frontend/API and evidence |
+|---|---|---|
+| Super Admin accounts, roles, deactivation/password reset, MFA | **WORKING** | `UserManagement.jsx` uses `/user-accounts/` and `/user-accounts/<id>/management/`; authentication/TOTP routes enforce onboarding and session evidence. Added `test_admin_account_role_and_organization_access_workflow` for account creation, role update, deactivation, and reactivation through the real API. |
+| Organizations, plans, Analyst/Reviewer/Client access grant and revoke | **WORKING** | Plan Audits setup uses `/organizations/`, `/plans/`, and `/organizations/<id>/users/`; API tests check scoped visibility and immediate denial after revocation. |
+| Reference data, source upload, pipeline jobs, audit logs | **WORKING** | Admin pages call reference catalog/detail, data-source upload/job, and audit-log APIs. Existing route/API tests cover catalog paging, file handling, job processing, source authorization, and logs. |
+| Analyst assigned workspace, claims explorer, price comparison, aggregate import, roster validation, audit calculation and analysis | **WORKING** | Analyst routes use organization-scoped APIs. `test_end_to_end_plan_audit_workflow` runs the actual offline extractor on isolated synthetic claims, imports only suppressed aggregates with manifest/hash checks, validates the network roster, and invokes the calculation engine. No raw claims are stored by the import endpoint. |
+| Reviewer queue, unit evidence, quality/provenance review, approval/rejection | **PARTIAL / BLOCKED BY APPROVAL** | Review and unit-validation endpoints enforce role, provenance, current-version binding, and independent-review restrictions. The real run remains unpublishable while unit evidence is unresolved. No external clinical reviewer evidence exists in this checkout; none was fabricated. |
+| Client assigned context, published-only dashboard, PDF/CSV, empty state and direct API isolation | **WORKING** | Client UI loads only published audits and authorized artifacts. API tests verify unpublished/rejected result and download denial, cross-organization isolation, and immediate loss of access on rejection or access revocation. |
+| Genuine approved report from this workspace’s current evidence | **BLOCKED_BY_APPROVAL** | The actual calculation produces unresolved unit review and no eligible savings. Approval returns 409 as designed. Existing publication-state test coverage uses a test-only injected marker/row to exercise state transitions; it is not counted as evidence that real financial results are publishable. |
+| Browser-level role/navigation run | **NOT TESTED** | Per Phase 2 instructions, browser E2E remains Phase 3; build and frontend role-policy tests are not represented as browser acceptance. |
+
+### Implementation and tests
+
+- Reused the Phase 1 role-aware workspaces, Django route authorization, organization scoping, client financial redaction, versioned calculation/report artifacts, MFA/CSRF/JWT controls, and offline extractor. No duplicate workflow or broad runtime refactor was needed.
+- Added `tests/test_api.py::test_admin_account_role_and_organization_access_workflow`. It exercises account creation and management through the same endpoints used by the UI, creates a synthetic organization and plan, grants assigned access, verifies role-scoped organization/plan listing, and checks that revocation removes access immediately. It also verifies that a disabled account cannot receive tenant access.
+- The real-calculation path is covered in `test_end_to_end_plan_audit_workflow`: the extractor and engine run on test-only synthetic claims, actual calculated per-unit values are asserted, and approval of unresolved units is denied. Later fixture-injected approval scenarios in that test verify version/provenance/rejection state-machine behavior only; their injected savings do not establish financial acceptance.
+- No operational or customer data, reference Parquet files, migration, or dependency was changed. No clinical signoff was invented.
+
+### Verification
+
+- Focused Admin, Analyst, Reviewer, and Client workflow tests: **6 passed** across the account-management workflow plus the existing role matrix, organization/plan workflow, real-extractor plan-audit lifecycle, and clinical-review authorization tests.
+- Full non-browser backend suite: `.venv\Scripts\python.exe -m pytest tests --ignore=tests/test_browser_e2e.py -q -p no:cacheprovider --basetemp=.venv\phase2-final-full-20261107` — **141 passed**.
+- Frontend role-policy tests: `npm --prefix frontend test` — **4 passed**.
+- Django system check: **PASS**.
+- `makemigrations --check --dry-run` and `migrate --check`: **PASS**, no migration changes or pending migrations.
+- Frontend production build: `npm --prefix frontend run build` — **PASS** (856 modules transformed).
+- Financial integrity and authorization regressions, including MK-01–MK-10: **PASS** in the full non-browser suite. This verifies code paths and test fixtures, not missing clinical or source evidence.
+- Browser E2E: **NOT TESTED**. `git diff --check` is recorded after this handoff update.
+
+### Outstanding blockers and limits
+
+1. A qualified clinical reviewer must provide and record genuine, drug-specific unit validation and evidence before an otherwise eligible audit can be approved. Until then, the real run’s publication denial is expected and must remain in force.
+2. Stored CMS source downloads needed to recompute source hashes are absent from this checkout. J0177 also has no ASP row for 2024Q1. Do not infer or manufacture either item.
+3. Browser-level workflow automation is deferred to Phase 3 as specified; no browser pass is claimed here.
+
+**Acceptance:** Admin **PASS**; Analyst real calculation/import path **PASS**; Reviewer authorization/review controls **PASS**, genuine clinical approval **BLOCKED**; Client direct API and publication-boundary controls **PASS**; financial calculation code path **PASS**, real publication **BLOCKED_BY_APPROVAL**; tenant isolation **PASS**; MK-01–MK-10 regressions **PASS**; required non-browser tests **PASS**. **PHASE 2: BLOCKED BY APPROVAL; do not proceed to Phase 3 until genuine clinical evidence is recorded.**
+
+---
+
+## PHASE 2 — INDEPENDENT IMPLEMENTATION COMPLETENESS REVIEW
+
+**Date:** 2026-11-07
+**Decision:** **BLOCKED_BY_APPROVAL**, not implementation-blocked. The audit found and fixed Client data-exposure and workspace omissions. Other reviewed workflow code paths are present. A real audit run is correctly rejected for publication while its clinical unit status is unresolved. The synthetic publication-state fixture is not counted as genuine clinical approval or as verified savings.
+
+### End-to-end feature map
+
+| Owning role / feature | Frontend action | API method and backend handler | Storage / dependencies | Authorization and evidence | Classification |
+|---|---|---|---|---|---|
+| Super Admin: account creation, role, disable/enable, password reset | `UserManagement.jsx`: create form, role/status buttons, password form | `GET/POST /user-accounts/` → `auth_views.user_management`; `POST /user-accounts/{id}/management/` → `auth_views.manage_user` | Django User, Groups, `AuditEvent` | `CanAdminister`; tests enforce role validation, password reset, inactive access denial; new `test_admin_account_role_and_organization_access_workflow` calls the same endpoints | **IMPLEMENTED BUT INTEGRATION UNTESTED** at the React/browser layer; backend API workflow tested |
+| Super Admin: MFA and sessions | Sign-in/enrollment flow in `main.jsx`; account security in `Settings.jsx` | CSRF/sign-in/TOTP/refresh/sign-out routes → `auth_views` | User session, OTP device/challenges, auth throttle records | MFA evidence, CSRF, JWT and rate-limit tests in `test_api.py` and `test_otp.py`; no security logic changed | **FULLY IMPLEMENTED AND TESTED** at API/unit level; browser flow not run |
+| Super Admin: organization, plan, access assignment/revocation | `PlanAudits.jsx`: create organization/plan, grant/revoke access | `GET/POST /organizations/`, `/plans/`; `GET/POST/DELETE /organizations/{id}/users/` → `plan_audit_setup` | `PlanOrganization`, `Plan`, `PlanOrganizationAccess`, `AuditEvent` | Admin write checks; visible organization/plan queries scoped to grants. `test_organization_and_plan_lifecycle`, new admin workflow, end-to-end grant/revoke and cross-organization denial | **IMPLEMENTED BUT INTEGRATION UNTESTED** at the React/browser layer; API and tenant behavior tested |
+| Super Admin / Analyst: CMS and hospital source ingestion, reference catalog, jobs | `Sources.jsx`, `ReferenceData.jsx`, `HospitalFiles.jsx`; upload/import/refresh/detail actions | `GET /data-sources/`, `POST /data-sources/uploads/`, `GET/POST /data-sources/processing-jobs/`, `GET /data-sources/processing-jobs/{id}/`, `GET /reference-data-sets/` and detail → `views.sources`, `source_upload`, `processing_jobs`, `processing_job_detail`, `reference_catalog`, `reference_table` | Source files, processing-job DB rows, configured Parquet outputs | Super Admin and authorized Analyst gates; file safety/job/reference tests include upload traversal, job processing, catalog paging. Local original CMS source downloads are absent; no real downloads were substituted | **IMPLEMENTED BUT INTEGRATION UNTESTED** against the actual source corpus; synthetic/API cases pass; source-hash recomputation is **BLOCKED BY DATA** |
+| Analyst: Claims Explorer and synthetic dataset registration | `ClaimsExplorer.jsx`: register dataset, select org/dataset, filter/page/detail | `GET/POST /claims/datasets/`; `GET /claims/synthea/summary/`, `/claims/`, `/claims/{id}/` → `claims_views` | `ClaimsExplorerDataset`, isolated Synthea/Parquet files and DuckDB queries | `CanAnalyze`, assigned organization and registered-dataset checks; claims filtering, privacy, SQL-injection and organization isolation tests | **IMPLEMENTED BUT INTEGRATION UNTESTED** at the React/browser layer; backend endpoints tested |
+| Analyst: local extraction, summary import, roster upload and validation | `PlanAudits.jsx`: preview/import aggregate+manifest; upload roster; inspect quarter coverage | `POST /plan-audits/import-summary/` → `import_plan_summary`; `GET /plan-audits/imports/`; `GET/POST /plans/{id}/network-roster/` → `plan_network_roster` | `ClaimsSummaryImport`, aggregate-only `ClaimsSummaryRecord`, `NetworkRosterEntry`; SHA-256 hashes; raw claims/roster files are not retained server-side | Analyst/Super Admin only for writes; exact schema, manifest hash, plan binding, suppression, NPI, interval-conflict checks. `test_end_to_end_plan_audit_workflow`, `test_mk09_network_status_requires_consistent_full_quarter_coverage`, extractor tests | **IMPLEMENTED BUT INTEGRATION UNTESTED** in browser; API/extractor integration tested on isolated synthetic data |
+| Analyst: create/run audit and financial analysis | `PlanAudits.jsx`: create/run; tabs for spending, drug, network, savings, review/report | `POST /plan-audits/create/`, `POST /plan-audits/{id}/run/`; GET overview/results/historical/drug/hospital/ASP/savings/quality → `plan_audit_imports`, `plan_audit_run`, `plan_audit_reports` | Immutable `PlanAuditRun`, `PlanAuditResult`, `SavingsOpportunity`; ASP/HPT/drug-scope Parquet and current unit reviews | `CanAnalyze`, org/plan/import binding, quarter-matched benchmarks, current run fingerprints. Real engine calculates from accepted synthetic aggregates in the end-to-end test; unresolved values keep null markup and fail closed | **IMPLEMENTED AND API-TESTED**; production-data availability **BLOCKED BY DATA** where source snapshots are missing |
+| Reviewer: clinical unit validation | `UnitValidation.jsx`: inspect CMS dosage/evidence and record a decision | `GET /drug-unit-validations/`, `GET /drug-selection-scope/`, `POST /drug-selection-scope/{hcpcs}/unit-review/` → `views.unit_validations`, `review_drug_unit` | `DrugUnitReview`, CMS scope/source hashes and dosage | Reviewer/Super Admin only; requires matching CMS billing quantity/unit, reviewer identity, evidence notes, and source binding. `test_mk07_reviewer_clinical_unit_validation_access` | **BLOCKED BY CLINICAL APPROVAL** for real publication; workflow/authorization API tested, no genuine signoff available |
+| Reviewer: audit quality, provenance, review, approval/rejection | `PlanAudits.jsx`: inspect provenance/quality/history; submit comment; approve/reject | `GET/POST /plan-audits/{id}/review/`, `POST .../approve/`, `POST .../reject/`, `GET .../quality/` → `audit_review`, `_set_review`, `audit_quality` | Append-only `AuditReview`, immutable run/artifact fingerprints, `AuditEvent` | Reviewer/Super Admin; current-version binding, creator/runner/artifact-builder independence, complete artifacts, valid unit quality. End-to-end test confirms genuine unresolved approval returns 409 and remains pending. Fixture-injected transition tests exercise approval/rejection mechanics separately | **IMPLEMENTED AND API-TESTED**; genuine approval **BLOCKED BY CLINICAL APPROVAL**; browser queue integration untested |
+| Client: published dashboard, historical/drug/hospital comparison, quality, savings, PDF/CSV | `ClientPlanAudits.jsx`: select published report, inspect comparison sections, download reports | GET `/plan-audits/`, `/{id}/overview/`, `/historical-spending/`, `/drug-analysis/`, `/hospital-comparison/`, `/asp-benchmark/`, `/savings/`, `/quality/`, `/report/`, `/export-csv/` | Published immutable run and verified artifacts; only validated/clinically approved savings returned | Client GET allowlist plus organization grant and `published_run` checks. Direct API tests assert no internal import/source references in Client payloads and no report access before publication/after rejection | **IMPLEMENTED BUT INTEGRATION UNTESTED** at the React/browser layer; Client API contract tested on isolated published-state fixture |
+
+### Confirmed gaps fixed
+
+1. Client audit list exposed `summary_import_id`; audit quality exposed the complete `validation_summary` including source provenance. Client result, hospital, ASP, network, and savings endpoints also returned `source_references`, and the stored analyst CSV was served unchanged to Clients. These exposed internal import/source lineage despite the Client boundary.
+2. `ClientPlanAudits.jsx` showed only headline totals and downloads. It did not render historical spending, drug/ASP comparisons, hospital reference comparisons, quality explanations, or validated savings.
+3. Client download button failures had no visible error state.
+
+Minimal fixes:
+
+- `plan_audit_common.audit_payload` now hides the summary import ID from Client payloads.
+- `plan_audit_run.audit_results`, `hospital_comparison`, and `asp_benchmark`, plus `plan_audit_reports.audit_quality`, `audit_network_validation`, and `audit_savings`, omit internal source/import metadata for Client-only accounts while preserving Reviewer/Analyst provenance.
+- The Client CSV endpoint verifies the published stored artifact and returns a deterministic CSV built from the same immutable run without the internal `source_references` column. Reviewer/Analyst downloads retain the source-reference column.
+- `ClientPlanAudits.jsx` now calls the published-only history, drug, hospital, quality, and savings endpoints and renders their user-facing fields, with safe empty states and visible download errors.
+- No finance calculation, clinical approval gate, tenant permission, MFA/CSRF/JWT, or stored audit artifact was weakened or modified.
+
+### Core workflow and saved-state evidence
+
+`test_end_to_end_plan_audit_workflow` now creates the main Analyst, Reviewer, and Client through the Admin user-management API, then assigns those accounts to the synthetic organization. It runs the actual extractor against temporary TEST claims, imports the accepted summary and roster through HTTP, creates and runs an audit, and checks persisted results.
+
+- Admin account creation: **201**; organization and plan creation: **201** each; organization access grant: **201**.
+- Aggregate extractor succeeds; summary import: **201**; network roster: **201**; audit creation: **201**; actual calculation: **200**.
+- Real calculation persists actual plan allowed/paid unit values and result provenance. The result has `UNIT_UNRESOLVED`; its markup remains null. Both PDF/CSV artifacts may be prepared for review, but Reviewer approval returns **409** with “Resolve blocking data quality issues before publication.” The run remains `calculation_status=completed`, `publication_status=pending`; `published_version` stays null and no approved review is saved. Client result request returns **404**.
+- The separate state-machine branch deliberately injects a test-only validated marker and synthetic savings row after the real calculation. Approval/rejection, stale-version denial, client publication access, downloads, and revocation are tested there only. That branch is not clinical approval evidence and its savings are not real financial results.
+- Client published-state contract tests verify the comparison/history/quality endpoints, redacted payloads, and CSV; Client endpoints return **404** after rejection. Cross-organization and unassigned Client requests also return **404**.
+
+### Test-quality and integration limits
+
+- `tests/test_api.py` exercises real Django endpoints using a disposable database and test-only datasets. The main synthetic workflow invokes the actual extractor and calculation engine; it does not use mocked financial calculations for the unresolved-run decision.
+- The later `validated_fixture_engine` inside `test_end_to_end_plan_audit_workflow` mutates result quality/source state and inserts one synthetic savings row. It tests lifecycle guards, not the real calculation result or clinical evidence.
+- `tests/test_pipeline.py`, `tests/test_client_extractor.py`, and `tests/test_reference_data.py` use synthetic fixture files; they do not download current CMS or hospital datasets. Unit/financial calculation edge cases and MK-01–MK-10 are covered there and in API regression tests.
+- Organization isolation is covered by `test_claims_explorer_organization_scoping_and_privacy` and the cross-organization cases in `test_end_to_end_plan_audit_workflow`.
+- The four frontend tests exercise role-policy helpers only. There is no component-level API interaction suite. Production build validates compilation, not browser behavior. Browser E2E was not run; React loading/error behavior and route composition therefore remain **frontend integration unverified**.
+
+### Files changed in this independent review
+
+- `backend/pricing/plan_audit_common.py`
+- `backend/pricing/plan_audit_run.py`
+- `backend/pricing/plan_audit_reports.py`
+- `frontend/src/pages/ClientPlanAudits.jsx`
+- `tests/test_api.py`
+- `docs/PROJECT_HANDOFF.md`
+
+No other files, raw sources, reference Parquet, operational/customer data, migrations, or dependencies were changed. Existing uncommitted work was preserved.
+
+### Final verification for independent review
+
+- Focused Client/Admin workflow and lifecycle contracts: **2 passed**; focused real unresolved clinical-gate test: **1 passed**.
+- Full non-browser backend suite: `.venv\Scripts\python.exe -m pytest tests --ignore=tests/test_browser_e2e.py -q -p no:cacheprovider --basetemp=.venv\phase2-independent-final2-20261107` — **141 passed, 0 failed, 0 skipped**.
+- Frontend role-policy tests: **4 passed**; React production build: **PASS** (856 modules).
+- Django system check: **PASS**. Migration checks: **PASS**, no changes or pending migrations.
+- `git diff --check`: **PASS** after this handoff edit.
+- Browser E2E: **NOT TESTED**.
+
+**Final decision:** **PHASE 2 BLOCKED_BY_APPROVAL.** Backend implementation gaps identified in the Client boundary and Client report page were fixed. Admin and Analyst business operations and backend authorization are verified; Reviewer workflow guards are verified; Client API privacy and publication controls are verified. Client React/browser integration remains unverified. Genuine clinical review is still required before any real run can be approved or published. Do not proceed to Phase 3.
+
+---
+
+## PHASE 3 — REAL BROWSER ACCEPTANCE
+
+**Date:** 2026-11-07
+**Technical result:** **VERIFIED** for the tested software workflows. The RG-01 suite ran in real Chromium in headless and headed modes against the React app, Django live server, disposable file-backed SQLite database, and actual calculation engine. This does not clear the separate clinical approval or business release gates.
+
+### Environment and isolation
+
+- Browser automation: Playwright Python 1.64.1; Chromium **156.0.8078.4**. Node.js **22.20.0**. The checked-in `.venv` Python environment was used.
+- Each invocation set `MESHKOR_TEST_DB_PATH` to a new `.venv\phase3-browser-<mode>-...sqlite3` path and passed a unique `.venv\phase3-browser-<mode>-...-tmp...` `--basetemp`. The final reported headless DB was `.venv\phase3-browser-headless-report-20261107.sqlite3`; the final headed DB was `.venv\phase3-browser-headed-offline-20261107.sqlite3`.
+- The test asserts the configured live-server database resolves to the exact environment-selected test path, exists as a file, and differs from both `data\operational\meshkor.sqlite3` and `settings.OPERATIONAL_DB_PATH`. It also verifies `pricing_auththrottlebucket` exists in that database after migrations.
+- Django `live_server` owned the backend process on a dynamically assigned localhost port. The test-owned Vite process used a dynamically reserved localhost port and `VITE_PROXY_API_TARGET=http://127.0.0.1:<live-server-port>`. The harness readiness-checks both services and terminates its own Vite process; pytest owns the live server lifecycle.
+- Synthetic users, organizations, plans, claims summaries, network roster, reference files, and hospital prices were used. Test artifacts remained in the dedicated ignored `.venv` directories. No operational database, customer data, or genuine reference files were modified.
+- The external Google Fonts stylesheet is fulfilled with an empty CSS response by the browser harness because this environment blocks outbound network access. The app uses its local fallback font during the run. No dependency or production source configuration was added for this test accommodation.
+
+### Browser results
+
+| Area | Result and observed evidence |
+|---|---|
+| Headless Chromium RG-01 | **PASS**, `1 passed` (final instrumented run: 63.29 seconds). |
+| Headed Chromium RG-01 | **PASS**, `1 passed` (77.60 seconds, `--slowmo 20`). |
+| Admin | **PASS** — MFA including invalid OTP rejection; admin dashboard, Django Admin session, account creation for Analyst/Reviewer/Client, organization and plan creation, access grants, Data Sources page/API and Audit Logs page/API. |
+| Analyst | **PASS** — assigned organization scope, price comparison page, permitted Claims Explorer, aggregate import, roster import, audit creation, actual calculation and report artifact generation. The test verifies that unresolved J1745 markup is null and renders “Not comparable.” |
+| Reviewer | **PASS** — unit-review screen and synthetic review record, tenant isolation, contributor independence, Reviewer run denial (403), unresolved audit approval denial (409), no publication for that unresolved audit, approval of the separate software-only fixture, then rejection and stale-binding denial. |
+| Client | **PASS** — account security page, correct empty state and direct unpublished PDF/CSV/results denial, direct Claims Explorer and Data Sources route denial, assigned published fixture display, and immediate report denial following rejection. |
+| Responsive layout | **PASS** — 1440×900 desktop and 390×844 mobile viewport; horizontal overflow assertions passed. Native required-field validation was also checked. |
+
+The headless browser observed **349×200, 15×201, 1×204, 8×401, 6×403, 2×409, and 14×404** API responses; **no API 5xx** occurred. The 401/403/404 responses were produced by deliberate unauthenticated, forbidden, unpublished, rejected, or cross-tenant requests. Both 409 responses were the unresolved clinical approval gate and stale approval binding. The browser test recorded no uncaught JavaScript errors and no unexpected console errors. The only blocked external resource was Google Fonts, handled by the explicit offline stylesheet route above.
+
+### Calculation, publication contract, and Client confidentiality
+
+- The Analyst browser uploads the extracted, suppressed synthetic aggregate and a synthetic roster, then triggers the actual calculation path. The test reads the persisted result through the real API. The unresolved J1745 result has no allowed markup; an independent Reviewer approval attempt returns 409 and `published_version` remains null.
+- A separate synthetic J9271 fixture has a synthetic unit review and synthetic hospital rates so the browser can exercise the existing server-side publication contract. Reviewer approval, Client serialization, historical/drug/hospital comparisons, and real generated PDF/CSV downloads were exercised through the browser. This is classified as **SOFTWARE PUBLICATION CONTRACT VERIFIED USING SYNTHETIC FIXTURES** only. It is not genuine clinical approval, validated market savings, production publication acceptance, or evidence that a real client report may be released.
+- Client API checks confirm no `source_references`, `import_quality`, or `summary_import_id` reaches the Client. Client CSV excludes `source_references` and `claims_summary_import_id`. The PDF begins with `%PDF-`; the CSV has the expected `hcpcs_code` header. The Client’s results and both report URLs return 404 before publication and after rejection. Cross-organization and reviewer-comment requests also remain inaccessible.
+- No clinical evidence was fabricated or treated as human signoff. A qualified clinical reviewer must still validate each real drug’s units before a genuine report can be published.
+
+### UI defect fixed
+
+The real Client browser flow found a render-time exception when the selected report changed from no selection to an ID: `useApi` briefly supplies `data: null` for newly activated section requests. Client render callbacks now safely handle that loading transition. This is a narrow defensive rendering fix in `ClientPlanAudits.jsx`; it does not change API permissions, calculation, publication, or report data.
+
+### Verification
+
+- Final instrumented headless browser run: `python -m pytest tests/test_browser_e2e.py -q -s -p no:cacheprovider --basetemp .venv\phase3-browser-headless-report-tmp-20261107` with the unique `MESHKOR_TEST_DB_PATH` above — **1 passed**.
+- Final headed browser run: `python -m pytest tests/test_browser_e2e.py -q -p no:cacheprovider --headed --slowmo 20 --basetemp .venv\phase3-browser-headed-offline-tmp-20261107` with its separate unique test DB — **1 passed**.
+- Backend regression suite: `.\.venv\Scripts\python.exe -m pytest tests --ignore=tests/test_browser_e2e.py -q -p no:cacheprovider --basetemp .venv\phase3-regression-final-20261107` — **141 passed**.
+- Frontend role tests: `npm --prefix frontend test` — **4 passed**.
+- Django `check` — **PASS**. `makemigrations --check --dry-run` — **PASS**, no changes detected. `migrate --check` — **PASS**.
+- React production build — **PASS**, 856 modules transformed.
+- `git diff --check` scoped to modified project files — **PASS**. An unrestricted invocation also traversed pre-existing `tmp_pytest` entries that are inaccessible in this environment; that directory was not cleaned or modified for this phase.
+
+### Modified files and remaining limits
+
+- Browser integration fix: `frontend/src/pages/ClientPlanAudits.jsx`.
+- Browser workflow coverage and isolated network/font instrumentation: `tests/test_browser_e2e.py`.
+- This Phase 3 handoff section: `docs/PROJECT_HANDOFF.md`.
+- Preserved earlier uncommitted Phase 2 work: `backend/pricing/plan_audit_common.py`, `backend/pricing/plan_audit_reports.py`, `backend/pricing/plan_audit_run.py`, and `tests/test_api.py`.
+
+The raw CMS source downloads needed for some provenance hash recomputation remain unavailable, and J0177 still has no ASP row for 2024Q1. Genuine clinical unit validation and business release authorization remain separate blockers for a real report. The test covers the current role workflows; it is not a comprehensive visual review of every page/control or every browser engine.
+
+**Acceptance:** RG-01 browser E2E **VERIFIED** in both modes; Admin, Analyst, Reviewer, Client, tenant restrictions, MFA, real calculation, expected clinical blocking, synthetic publication contract, Client confidentiality, downloads, desktop/mobile assertions, backend/frontend regressions, migrations, and build **PASS**. **PHASE 3 TECHNICAL VERIFICATION: VERIFIED.** Real clinical signoff and business release remain pending. No commit, push, or deployment was performed.

@@ -1,5 +1,6 @@
 """Playwright browser checks against Django's disposable pytest database."""
 import csv
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import os
@@ -198,6 +199,7 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
     import hashlib
     from decimal import Decimal
     from django.contrib.auth import get_user_model
+    from django.db import connections
     from pricing.models import (ClaimsSummaryImport, Plan, PlanAudit, PlanOrganization,
                                 PlanOrganizationAccess)
     from pipeline import build_compare, select_drugs
@@ -206,9 +208,13 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
     origin, backend_url = browser_app
     # The fixture must never point at the configured operational DB.
     operational_db = str(ROOT / "data" / "operational" / "meshkor.sqlite3")
-    assert settings.DATABASES["default"]["NAME"] != operational_db
-    assert settings.DATABASES["default"]["NAME"] != str(settings.OPERATIONAL_DB_PATH)
-    print("Using isolated test database:", settings.DATABASES["default"]["NAME"])
+    test_db = Path(settings.DATABASES["default"]["NAME"]).resolve()
+    assert test_db != Path(operational_db).resolve()
+    assert test_db != Path(settings.OPERATIONAL_DB_PATH).resolve()
+    assert test_db == Path(os.environ["MESHKOR_TEST_DB_PATH"]).resolve()
+    assert test_db.is_file()
+    assert "pricing_auththrottlebucket" in connections["default"].introspection.table_names()
+    print("Using isolated test database:", test_db)
 
     monkeypatch.setattr(
         plan_audit_engine,
@@ -233,7 +239,6 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
     run_tag = secrets.token_hex(4)
     admin_name = f"rg01-admin-{run_tag}"
     admin_password = secrets.token_urlsafe(24) + "F3!"
-    from django.db import connections
     admin_user, admin_secret = _new_enabled_user(admin_name, admin_password, superuser=True)
     connections.close_all()
     db_executor = ThreadPoolExecutor(max_workers=1)
@@ -263,7 +268,7 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         headless=not request.config.getoption("--headed"),
         slow_mo=request.config.getoption("--slowmo"),
     )
-    context = browser.new_context(viewport={"width": 1440, "height": 1000}, accept_downloads=True)
+    context = browser.new_context(viewport={"width": 1440, "height": 900}, accept_downloads=True)
     context.set_default_timeout(12_000)
     context.set_default_navigation_timeout(15_000)
     pages = []
@@ -273,6 +278,10 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
 
     def new_page(browser_context):
         page = browser_context.new_page()
+        # The sandbox has no outbound network; let the UI use its local font
+        # fallback without emitting a misleading Google Fonts network failure.
+        page.route("https://fonts.googleapis.com/**",
+                   lambda route: route.fulfill(status=200, content_type="text/css", body=""))
         pages.append(page)
         page.on("response", lambda response: api_responses.append((
             response.request.method, urlsplit(response.url).path, response.status
@@ -310,6 +319,12 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         assert "ANALYST" in db_call(lambda: list(analyst_user.groups.values_list("name", flat=True)))
         assert "REVIEWER" in db_call(lambda: list(reviewer_a_user.groups.values_list("name", flat=True)))
         assert "CLIENT" in db_call(lambda: list(client_user.groups.values_list("name", flat=True)))
+        page.goto(origin + "/data-sources")
+        page.get_by_role("heading", name="Sources & uploads").wait_for()
+        assert _api(page, "/api/v1/data-sources/")["status"] == 200
+        page.goto(origin + "/audit-logs")
+        page.get_by_role("heading", name="Audit logs").wait_for()
+        assert _api(page, "/api/v1/audit-logs/")["status"] == 200
 
         page.goto(origin + "/plan-specific-audits")
         page.get_by_role("tab", name="Plan Setup").click()
@@ -381,6 +396,12 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         analyst_orgs = _api(analyst_page, "/api/v1/organizations/")
         assert analyst_orgs["status"] == 200
         assert [row["id"] for row in analyst_orgs["payload"]] == [organization.pk]
+        analyst_page.goto(origin + "/hospital-drug-price-comparisons")
+        analyst_page.get_by_role("heading", name="Released hospital comparisons").wait_for()
+        analyst_page.goto(origin + "/claims-explorer")
+        analyst_page.get_by_role("heading", name="Claims Explorer").wait_for()
+        assert _api(analyst_page, f"/api/v1/claims/datasets/?organization_id={organization.pk}")["status"] == 200
+        analyst_page.goto(origin + "/plan-specific-audits")
 
         main_summary, main_manifest = _write_extract(tmp_path, plan_reference, "J9271", [
             ("1000000004", "140", "100"), ("1000000012", "10", "8"),
@@ -414,6 +435,9 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         main_audit = db_call(PlanAudit.objects.get, audit_name="RG01 Eligible Synthetic Audit")
         page.get_by_role("button", name="Run audit").click()
         page.get_by_text("Audit run finished.", exact=False).wait_for()
+        main_results = _api(page, f"/api/v1/plan-audits/{main_audit.pk}/results/")
+        assert main_results["status"] == 200
+        assert main_results["payload"]["results"]
         page.get_by_role("tab", name="Review & Reports").click()
         page.get_by_role("button", name="Generate and download PDF").wait_for()
         with page.expect_download() as generated_pdf:
@@ -428,6 +452,8 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         self_approval = _api(page, f"/api/v1/plan-audits/{main_audit.pk}/approve/",
                              method="POST", body=binding)
         assert self_approval["status"] == 403
+        assert _api(reviewer_page, f"/api/v1/plan-audits/{main_audit.pk}/run/",
+                    method="POST", body={})["status"] == 403
 
         # Analyst runs a separate unresolved J1745 audit; its markup stays
         # explicitly Not comparable and cannot affect the eligible J9271 run.
@@ -443,10 +469,40 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         unresolved_audit = db_call(PlanAudit.objects.get, audit_name="RG01 Unresolved Synthetic Audit")
         analyst_page.get_by_role("button", name="Run audit").click()
         analyst_page.get_by_text("Audit run finished.", exact=False).wait_for()
+        unresolved_results = _api(analyst_page, f"/api/v1/plan-audits/{unresolved_audit.pk}/results/")
+        assert unresolved_results["status"] == 200
+        assert all(row["allowed_markup_multiple"] is None
+                   for row in unresolved_results["payload"]["results"])
         analyst_page.get_by_role("tab", name="Drug Cost Analysis").click()
         analyst_page.get_by_text("Not comparable", exact=True).first.wait_for()
         assert _api(analyst_page, f"/api/v1/plan-audits/{unresolved_audit.pk}/approve/",
                     method="POST", body={})["status"] in {403, 400}
+        unresolved_metadata = _api(reviewer_page, f"/api/v1/plan-audits/{unresolved_audit.pk}/")
+        assert unresolved_metadata["status"] == 200
+        unresolved_approval = _api(reviewer_page, f"/api/v1/plan-audits/{unresolved_audit.pk}/approve/",
+            method="POST", body={"version": unresolved_metadata["payload"]["current_version"],
+                                  "result_fingerprint": unresolved_metadata["payload"]["result_fingerprint"],
+                                  "comments": "Synthetic unresolved-unit gate check."})
+        assert unresolved_approval["status"] == 409
+        unresolved_metadata = _api(reviewer_page, f"/api/v1/plan-audits/{unresolved_audit.pk}/")
+        assert unresolved_metadata["payload"]["published_version"] is None
+
+        # Before publication, the assigned Client sees the correct empty state
+        # and cannot fetch results or either report artifact by direct URL.
+        client_context = browser.new_context(viewport={"width": 390, "height": 844}, accept_downloads=True)
+        client_page = new_page(client_context)
+        _sign_in(client_page, origin, client_name, client_password, client_secret)
+        client_page.goto(origin + "/plan-specific-audits")
+        client_page.get_by_text("No approved plan reports are currently assigned to your account.").wait_for()
+        assert _api(client_page, f"/api/v1/plan-audits/{main_audit.pk}/results/")["status"] == 404
+        assert _api(client_page, f"/api/v1/plan-audits/{main_audit.pk}/report/")["status"] == 404
+        assert _api(client_page, f"/api/v1/plan-audits/{main_audit.pk}/export-csv/")["status"] == 404
+        client_page.goto(origin + "/claims-explorer")
+        client_page.get_by_role("heading", name="Access denied").wait_for()
+        client_page.goto(origin + "/data-sources")
+        client_page.get_by_role("heading", name="Access denied").wait_for()
+        client_page.goto(origin + "/application-settings")
+        client_page.get_by_role("heading", name="Account security").wait_for()
 
         # Unassigned reviewer cannot read another tenant's audit, even by ID.
         other_import = db_call(ClaimsSummaryImport.objects.create,
@@ -470,20 +526,56 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
 
         # Client can read only the assigned, published audit and downloads both
         # stored artifacts through actual browser requests.
-        client_context = browser.new_context(viewport={"width": 390, "height": 844}, accept_downloads=True)
-        client_page = new_page(client_context)
-        _sign_in(client_page, origin, client_name, client_password, client_secret)
         client_page.goto(origin + "/plan-specific-audits")
-        client_page.get_by_role("heading", name="Plan-specific infusion drug audits").wait_for()
-        client_page.get_by_label("Audit").select_option(str(main_audit.pk))
-        assert _api(client_page, f"/api/v1/plan-audits/{main_audit.pk}/results/")["status"] == 200
+        try:
+            client_page.get_by_role("heading", name="Approved plan reports").wait_for(timeout=5000)
+        except Exception:
+            print("Client route diagnostic:", client_page.url, client_page.title(),
+                  client_page.locator("body").inner_text(timeout=2000)[:1200],
+                  "page_errors=", page_errors, "console_errors=", console_errors,
+                  "api_responses=", api_responses[-20:])
+            raise
+        client_page.get_by_role("button", name="View summary").click()
+        client_page.get_by_role("heading", name="Historical spending").wait_for()
+        client_page.get_by_role("heading", name="Drug comparison").wait_for()
+        client_page.get_by_role("heading", name="Hospital price comparison").wait_for()
+        client_page.wait_for_function(
+            "document.querySelectorAll('.loading-skeleton').length === 0", timeout=15000)
+        exploration_screenshots = os.environ.get("MESHKOR_EXPLORATION_SCREENSHOT_DIR")
+        if exploration_screenshots:
+            screenshot_dir = Path(exploration_screenshots)
+            screenshot_dir.mkdir(parents=True, exist_ok=True)
+            client_page.screenshot(path=str(screenshot_dir / "client--synthetic-published-report.png"),
+                                  full_page=True, animations="disabled")
+        published_results = _api(client_page, f"/api/v1/plan-audits/{main_audit.pk}/results/")
+        assert published_results["status"] == 200
+        assert all("source_references" not in row for row in published_results["payload"]["results"])
+        client_quality = _api(client_page, f"/api/v1/plan-audits/{main_audit.pk}/quality/")
+        assert client_quality["status"] == 200
+        assert "import_quality" not in client_quality["payload"]
+        client_metadata = _api(client_page, f"/api/v1/plan-audits/{main_audit.pk}/")
+        assert client_metadata["status"] == 200
+        assert client_metadata["payload"]["summary_import_id"] is None
+        assert _api(client_page, "/api/v1/claims/datasets/")["status"] == 403
+        assert _api(client_page, f"/api/v1/plan-audits/{main_audit.pk}/review/")["status"] == 404
+        assert _api(client_page, f"/api/v1/plan-audits/{unresolved_audit.pk}/results/")["status"] == 404
+        assert _api(client_page, f"/api/v1/plan-audits/{unresolved_audit.pk}/report/")["status"] == 404
         assert _api(client_page, f"/api/v1/plan-audits/{foreign_audit.pk}/results/")["status"] == 404
         with client_page.expect_download() as csv_download:
-            client_page.get_by_role("button", name="Download results CSV").click()
+            client_page.get_by_role("button", name="Download approved CSV").click()
+        csv_path = tmp_path / "client-approved.csv"
+        csv_download.value.save_as(str(csv_path))
         assert csv_download.value.suggested_filename.endswith(".csv")
+        csv_text = csv_path.read_text(encoding="utf-8-sig")
+        assert "hcpcs_code" in csv_text.splitlines()[0]
+        assert "source_references" not in csv_text
+        assert "claims_summary_import_id" not in csv_text
         with client_page.expect_download() as pdf_download:
             client_page.get_by_role("button", name="Download approved PDF").click()
+        pdf_path = tmp_path / "client-approved.pdf"
+        pdf_download.value.save_as(str(pdf_path))
         assert pdf_download.value.suggested_filename.endswith(".pdf")
+        assert pdf_path.read_bytes().startswith(b"%PDF-")
 
         # Reviewer B rejects with a required reason; both the client and stale
         # Reviewer A bindings are denied immediately afterward.
@@ -506,8 +598,7 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         for suffix in ("overview/", "results/", "report/", "export-csv/", "savings/"):
             assert _api(client_page, f"/api/v1/plan-audits/{main_audit.pk}/{suffix}")["status"] == 404
         client_page.reload()
-        client_page.get_by_text("Rejected — publication revoked").wait_for()
-        assert client_page.get_by_role("button", name="Download results CSV").is_disabled()
+        client_page.get_by_text("No approved plan reports are currently assigned to your account.").wait_for()
 
         # Revoke Reviewer A organization membership while that browser session
         # remains live; server-side authorization must deny its next request.
@@ -521,13 +612,21 @@ def test_rg01_browser_workflow_and_authorization(browser_app, built, tmp_path, s
         # Basic mobile width and native required-field validation.
         client_page.set_viewport_size({"width": 390, "height": 844})
         assert client_page.evaluate("document.documentElement.scrollWidth <= window.innerWidth + 1")
-        page.set_viewport_size({"width": 1440, "height": 1000})
+        page.set_viewport_size({"width": 1440, "height": 900})
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth + 1")
         page.goto(origin + "/user-management")
         required = page.locator('form input[name="username"]')
         assert required.evaluate("element => !element.checkValidity()")
         assert not page_errors, page_errors
-        assert not console_errors, console_errors
-        assert not [(method, path, status) for method, path, status in api_responses if status >= 500]
+        unexpected_console_errors = [message for message in console_errors
+                                     if (not message.startswith("Failed to load resource:")
+                                         or "ERR_NETWORK_ACCESS_DENIED" in message)]
+        assert not unexpected_console_errors, unexpected_console_errors
+        server_errors = [(method, path, status) for method, path, status in api_responses if status >= 500]
+        assert not server_errors, server_errors
+        print("Browser API status counts:", dict(Counter(status for _, _, status in api_responses)))
+        print("Expected authorization responses:", dict(Counter(
+            status for _, _, status in api_responses if status in {401, 403, 404})))
 
     except Exception:
         # Capture only screenshots after removing transient password/OTP input.
