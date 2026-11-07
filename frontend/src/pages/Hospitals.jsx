@@ -10,10 +10,9 @@ export default function Hospitals({ user }) {
       {(rows) => (
         <>
           <section>
-            <h1>Hospitals</h1>
             <p className="lede">{isAdmin
-              ? "One row per stored hospital price file, including files without selected-drug rows and parser errors."
-              : "Hospitals with released, clinically reviewed price comparisons in the current report."}</p>
+              ? "Hospital price coverage and comparison status."
+              : "Hospitals in the released report."}</p>
             <MarkupBars rows={rows} labelKey="hospital_label" />
           </section>
           <section>

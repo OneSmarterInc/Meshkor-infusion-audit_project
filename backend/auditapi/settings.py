@@ -28,8 +28,15 @@ if not SECRET_KEY:
         raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set when DEBUG is disabled.")
     SECRET_KEY = secrets.token_urlsafe(48)
 ALLOWED_HOSTS = [host.strip() for host in
-                 os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(",")
+                 os.environ.get("DJANGO_ALLOWED_HOSTS",
+                                "localhost,127.0.0.1,testserver" if DEBUG else "").split(",")
                  if host.strip()]
+if not DEBUG:
+    if len(SECRET_KEY) < 50 or SECRET_KEY.strip().casefold() in {
+            "replace-with-a-random-secret-before-deployment", "django-insecure-secret-key"}:
+        raise ImproperlyConfigured("Set DJANGO_SECRET_KEY to a unique random value of at least 50 characters.")
+    if not ALLOWED_HOSTS or "*" in ALLOWED_HOSTS:
+        raise ImproperlyConfigured("Set DJANGO_ALLOWED_HOSTS to the exact production host names.")
 
 INSTALLED_APPS = [
     "pricing.admin_config.MFAAdminConfig",
@@ -68,9 +75,15 @@ TEMPLATES = [{
     ]},
 }]
 
-OPERATIONAL_DB_PATH = Path(os.environ.get(
-    "OPERATIONAL_DB_PATH", str(PROJECT_DIR / "data" / "operational" / "meshkor.sqlite3")))
-OPERATIONAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+DEFAULT_OPERATIONAL_DB_PATH = PROJECT_DIR / "data" / "operational" / "meshkor.sqlite3"
+OPERATIONAL_DB_PATH = Path(os.environ.get("OPERATIONAL_DB_PATH", str(DEFAULT_OPERATIONAL_DB_PATH)))
+OPERATIONAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+if (os.name != "nt"
+        and OPERATIONAL_DB_PATH.parent.resolve() == DEFAULT_OPERATIONAL_DB_PATH.parent.resolve()):
+    # Keep SQLite, WAL, and SHM files private to the service account.
+    OPERATIONAL_DB_PATH.parent.chmod(0o700)
+    if OPERATIONAL_DB_PATH.exists():
+        OPERATIONAL_DB_PATH.chmod(0o600)
 DATABASES = {"default": {
     "ENGINE": "django.db.backends.sqlite3",
     "NAME": str(OPERATIONAL_DB_PATH),
@@ -111,6 +124,14 @@ SECURE_HSTS_SECONDS = 31_536_000 if not DEBUG and SECURE_SSL_REDIRECT else 0
 SECURE_HSTS_INCLUDE_SUBDOMAINS = False
 JWT_ACCESS_TOKEN_SECONDS = int(os.environ.get("JWT_ACCESS_TOKEN_SECONDS", "900"))
 TOTP_ENCRYPTION_KEY = os.environ.get("TOTP_ENCRYPTION_KEY", "")
+if not DEBUG:
+    if not TOTP_ENCRYPTION_KEY:
+        raise ImproperlyConfigured("Set TOTP_ENCRYPTION_KEY before running in production.")
+    try:
+        from cryptography.fernet import Fernet
+        Fernet(TOTP_ENCRYPTION_KEY.encode("ascii"))
+    except (ImportError, ValueError, UnicodeEncodeError) as exc:
+        raise ImproperlyConfigured("TOTP_ENCRYPTION_KEY must be a valid Fernet key.") from exc
 TOTP_PAST_WINDOW_STEPS = int(os.environ.get("TOTP_PAST_WINDOW_STEPS", "0"))
 TOTP_FUTURE_WINDOW_STEPS = int(os.environ.get("TOTP_FUTURE_WINDOW_STEPS", "0"))
 if TOTP_PAST_WINDOW_STEPS < 0 or TOTP_FUTURE_WINDOW_STEPS < 0:
@@ -125,7 +146,8 @@ CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"
 # are explicitly configured.
 dev_origins = ["http://localhost:5173", "http://127.0.0.1:5173",
                "http://localhost:5174", "http://127.0.0.1:5174",
-               "http://localhost:5175", "http://127.0.0.1:5175"]
+               "http://localhost:5175", "http://127.0.0.1:5175",
+               "http://localhost:5176", "http://127.0.0.1:5176"]
 CORS_ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get(
     "DJANGO_CORS_ALLOWED_ORIGINS", ",".join(dev_origins) if DEBUG else ""
 ).split(",") if origin.strip()]

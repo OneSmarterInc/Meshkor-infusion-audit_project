@@ -29,7 +29,7 @@ from rest_framework.response import Response
 from django.conf import settings
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from django.db import connections
+from django.db import IntegrityError, OperationalError, connections, transaction
 
 from . import data
 from .models import AuditEvent, DrugUnitReview, ProcessingJob, ReportRecord, SourceFile
@@ -452,13 +452,16 @@ def source_upload(request):
         target_dir = raw_root / "Hospital Enrollments" / "uploads"
     else:
         target_dir = raw_root / source_key / "uploads"
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        target_dir.chmod(0o700)
     file_id = uuid.uuid4().hex
     partial_path = target_dir / f"{file_id}.part"
     digest = hashlib.sha256()
     written = 0
     try:
-        with partial_path.open("xb") as dest:
+        file_descriptor = os.open(partial_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(file_descriptor, "wb") as dest:
             for chunk in upload.chunks():
                 written += len(chunk)
                 if written > max_bytes:
@@ -504,6 +507,29 @@ def source_upload(request):
                      "sha256": record.sha256, "status": record.status}, status=201)
 
 
+def _start_processing_worker(job):
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(
+            [sys.executable, "manage.py", "process_jobs", "--once"],
+            cwd=settings.BASE_DIR,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=flags,
+            start_new_session=(os.name != "nt"),
+        )
+    except OSError:
+        logger.exception("Could not start the data worker for job %s", job.pk)
+        job.status = "failed"
+        job.error = "Could not start the data worker. Contact an administrator."
+        job.finished_at = timezone.now()
+        job.save(update_fields=["status", "error", "finished_at"])
+        return False
+    return True
+
+
 @api_view(["GET", "POST"])
 @permission_classes([CanAnalyze])
 def processing_jobs(request):
@@ -511,28 +537,45 @@ def processing_jobs(request):
         job_type = str(request.data.get("job_type", "")).strip()
         if job_type not in {"refresh_data", "market_report"}:
             return Response({"error": "job_type must be refresh_data or market_report."}, status=400)
-        job = ProcessingJob.objects.create(job_type=job_type, requested_by=request.user)
+        try:
+            with transaction.atomic():
+                active_job = (ProcessingJob.objects.select_for_update()
+                              .filter(status__in=("queued", "running"))
+                              .order_by("created_at").first())
+                job = active_job or ProcessingJob.objects.create(
+                    job_type=job_type, requested_by=request.user)
+                is_recovery = active_job is not None
+        except (IntegrityError, OperationalError):
+            # Fail closed if concurrent queue requests contend for the SQLite write lock.
+            logger.warning("A processing job could not be queued because another request owns the queue.")
+            return Response({"error": "A data processing job is already queued or running."}, status=409)
+        if is_recovery:
+            from pipeline.snapshots import pipeline_mutex
+            try:
+                with pipeline_mutex(settings.BASE_DIR.parent, blocking=False) as acquired:
+                    if not acquired:
+                        return Response({"error": "A data processing job is already running.",
+                                         "id": job.pk, "status": job.status}, status=409)
+                    started = _start_processing_worker(job)
+            except OSError:
+                logger.exception("Could not check the data worker lock for job %s", job.pk)
+                return Response({"error": "Could not verify the data worker state. Contact an administrator."},
+                                status=503)
+            if not started:
+                AuditEvent.objects.create(actor=request.user, action="processing_job_finished",
+                                          entity_type="job", entity_id=str(job.pk),
+                                          details={"job_type": job.job_type, "status": "failed"})
+                return Response({"error": job.error, "id": job.pk, "status": job.status}, status=503)
+            AuditEvent.objects.create(actor=request.user, action="processing_job_recovery_started",
+                                      entity_type="job", entity_id=str(job.pk),
+                                      details={"job_type": job.job_type, "previous_status": job.status})
+            return Response({"id": job.pk, "job_type": job.job_type, "status": job.status,
+                             "progress": job.progress, "recovery_scheduled": True}, status=202)
         AuditEvent.objects.create(actor=request.user, action="processing_job_queued", entity_type="job",
                                   entity_id=str(job.pk), details={"job_type": job_type})
         # Start a short-lived worker for this job so an upload can be imported
         # from the UI without requiring a separate worker terminal.
-        try:
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            subprocess.Popen(
-                [sys.executable, "manage.py", "process_jobs", "--once"],
-                cwd=settings.BASE_DIR,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                creationflags=flags,
-                start_new_session=(os.name != "nt"),
-            )
-        except OSError as exc:
-            job.status = "failed"
-            job.error = f"Could not start the data worker: {exc}"
-            job.finished_at = timezone.now()
-            job.save(update_fields=["status", "error", "finished_at"])
+        if not _start_processing_worker(job):
             AuditEvent.objects.create(actor=request.user, action="processing_job_finished",
                                       entity_type="job", entity_id=str(job.pk),
                                       details={"job_type": job.job_type, "status": "failed"})

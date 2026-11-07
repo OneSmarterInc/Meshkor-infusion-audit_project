@@ -1,5 +1,29 @@
 # MeshKor Project Handoff
 
+## Current status and historical notes (2026-11-06)
+
+This file contains dated implementation records, including earlier findings
+that were later fixed. When sections conflict, use the newest dated disposition
+for that issue; older `BEFORE`, baseline, and independent-review sections are
+historical evidence, not the current status. The 2026-11-04 repository review
+identified 23 findings. MK-01 through MK-23 have code/documentation changes
+recorded here or in the current README and extractor guide. Deployment,
+real-data, browser, and production-database checks are separate acceptance
+steps and must not be inferred from synthetic regression results.
+
+### P3 closure — MK-22 and MK-23
+
+- **MK-22 — Documentation contradiction: COMPLETE.** README now describes
+  implemented plan-specific claims audits and organization-scoped access, and
+  states the actual payer-file limitation. This handoff labels dated baseline
+  and `BEFORE` sections as historical so they are not mistaken for current
+  status.
+- **MK-23 — Extractor count units: COMPLETE.** `excluded_records` counts
+  excluded claim records only. Aggregate cells have separate
+  `excluded_aggregate_cells`, `suppressed_aggregate_cells`,
+  `rejected_aggregate_cells`, and `aggregate_cell_reasons` fields. The extractor
+  guide documents their units and reconciliation.
+
 ## RG-01 — Browser E2E Verification (2026-11-05)
 
 **Decision: RG-01 BLOCKED.** A real Chromium browser was launched in both headless and headed modes against the React/Vite app and Django `live_server`, using disposable users and the pytest synthetic data root. Neither run completed the end-to-end workflow. No customer/operational database was used; pytest configured a shared in-memory SQLite database. No credentials, OTP secrets, tokens, cookies, screenshots, or traces were added to tracked files. Temporary logs and sanitized failure screenshots are under ignored `.pytest-tmp/`.

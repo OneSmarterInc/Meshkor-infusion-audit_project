@@ -53,8 +53,7 @@ export default function UserManagement({ user }) {
   }
 
   return <>
-    <h1>User management</h1>
-    <p className="lede">Manage Super Admin, Analyst, Reviewer, and Client accounts. Every account uses Google Authenticator.</p>
+    <p className="lede">Manage application accounts and roles.</p>
     <section>
       <h2>Create account</h2>
       <form className="source-upload-form" onSubmit={createAccount}>

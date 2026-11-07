@@ -20,7 +20,7 @@ export default function HospitalDetail({ user }) {
               File status: {d.file_status.replaceAll("_", " ")} · {d.items_scanned ?? 0} items scanned · {d.drug_rows ?? d.n_rows ?? 0} selected-drug rows
               {d.file_error ? ` · ${d.file_error}` : ""}
             </p>}
-            {isAdmin && <p className="muted mono">{d.source_file}</p>}
+            {isAdmin && d.source_file && <p className="muted">Source: {d.source_file.split(/[\\/]/).pop()}</p>}
             {isAdmin && <div className="status-row">
               {d.statuses.map((s) => (
                 <span key={s.status}><StatusPill status={s.status} /> {fmt.n(s.n)}</span>
@@ -47,7 +47,7 @@ export default function HospitalDetail({ user }) {
           </section>
           <section>
             <h2>{isAdmin ? "Every rate in this file" : "Released price comparisons"}</h2>
-            {d.n_rows === 0 ? <p className="note">This file has no comparison rows. See its import status above and the Data Quality page for details.</p>
+            {d.n_rows === 0 ? <p className="note">No price comparison records found for this hospital.</p>
               : <RatesTable fixed={{ hospital_key: key }} user={user} />}
           </section>
         </>
