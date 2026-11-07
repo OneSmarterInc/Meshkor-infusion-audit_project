@@ -290,7 +290,7 @@ def import_plan_summary(request):
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def plan_summary_imports(request):
     queryset = ClaimsSummaryImport.objects.select_related("organization", "plan").filter(
         organization__in=visible_organizations(request.user))
@@ -300,13 +300,13 @@ def plan_summary_imports(request):
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def plan_summary_import_detail(request, import_id):
     return Response(import_payload(get_visible_import(request.user, import_id)))
 
 
 @api_view(["GET"])
-@permission_classes([CanView])
+@permission_classes([CanAnalyze])
 def plan_summary_import_quality(request, import_id):
     item = get_visible_import(request.user, import_id)
     return Response({"import_id": item.pk, "file_hash": item.file_hash,

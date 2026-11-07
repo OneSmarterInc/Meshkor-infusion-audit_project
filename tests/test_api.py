@@ -274,6 +274,229 @@ def test_four_role_backend_permission_matrix():
 
 
 @pytest.mark.django_db
+def test_mk26_platform_writes_and_mk29_reviewer_import_inventory_are_denied(client, monkeypatch):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    from pricing.permissions import APPLICATION_ROLES
+    from pricing import plan_audit_imports, views
+
+    factory = APIRequestFactory()
+    monkeypatch.setattr(views, "_start_processing_worker", lambda job: False)
+    for role in APPLICATION_ROLES:
+        user = get_user_model().objects.create_user(
+            username=f"mk26-{role.lower()}", password="test-only-password")
+        user.groups.add(Group.objects.get_or_create(name=role)[0])
+        request = factory.post("/api/v1/data-sources/processing-jobs/",
+                               {"job_type": "refresh_data"}, format="json")
+        force_authenticate(request, user=user)
+        response = views.processing_jobs(request)
+        assert response.status_code == (503 if role == "SUPER_ADMIN" else 403)
+
+        upload = factory.post("/api/v1/data-sources/upload/", {}, format="multipart")
+        force_authenticate(upload, user=user)
+        assert views.source_upload(upload).status_code == (400 if role == "SUPER_ADMIN" else 403)
+
+        imports = factory.get("/api/v1/plan-audits/imports/")
+        force_authenticate(imports, user=user)
+        result = plan_audit_imports.plan_summary_imports(imports)
+        assert result.status_code == (200 if role in {"SUPER_ADMIN", "ANALYST"} else 403)
+
+
+@pytest.mark.django_db
+def test_import_inventory_and_audit_creation_use_accepted_tenant_scoped_imports(client):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    from pricing.models import (ClaimsSummaryImport, Plan, PlanAudit,
+                                PlanOrganization, PlanOrganizationAccess)
+    from pricing import plan_audit_imports
+
+    User = get_user_model()
+    admin = User.objects.get(username="audit-test-admin")
+    analyst = User.objects.create_user(username="mk30-import-analyst", password="test-password")
+    analyst.groups.add(Group.objects.get_or_create(name="ANALYST")[0])
+    reviewer = User.objects.create_user(username="mk30-import-reviewer", password="test-password")
+    reviewer.groups.add(Group.objects.get_or_create(name="REVIEWER")[0])
+    client_user = User.objects.create_user(username="mk30-import-client", password="test-password")
+    client_user.groups.add(Group.objects.get_or_create(name="CLIENT")[0])
+
+    organization = PlanOrganization.objects.create(
+        organization_name="MK30 Assigned Import Org", organization_type="employer")
+    plan = Plan.objects.create(organization=organization, plan_name="Assigned plan",
+                               plan_reference="MK30-ASSIGNED")
+    foreign_org = PlanOrganization.objects.create(
+        organization_name="MK30 Foreign Import Org", organization_type="employer")
+    foreign_plan = Plan.objects.create(organization=foreign_org, plan_name="Foreign plan",
+                                       plan_reference="MK30-FOREIGN")
+    PlanOrganizationAccess.objects.create(organization=organization, user=analyst, granted_by=admin)
+
+    accepted = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="accepted-synthetic.csv",
+        file_hash="a" * 64, schema_version="test-v1", import_status="accepted",
+        source_period="2026Q4")
+    rejected = ClaimsSummaryImport.objects.create(
+        organization=organization, plan=plan, source_file_name="rejected-synthetic.csv",
+        file_hash="b" * 64, schema_version="test-v1", import_status="rejected")
+    foreign = ClaimsSummaryImport.objects.create(
+        organization=foreign_org, plan=foreign_plan, source_file_name="foreign-synthetic.csv",
+        file_hash="c" * 64, schema_version="test-v1", import_status="accepted")
+
+    factory = APIRequestFactory()
+
+    admin_list = client.get(f"/api/v1/plan-audits/imports/?plan_id={plan.pk}")
+    assert admin_list.status_code == 200
+    assert {item["id"] for item in admin_list.json()} == {accepted.pk, rejected.pk}
+
+    def call(user, method, view, path, data=None, **kwargs):
+        request = (factory.get(path) if method == "GET" else
+                   factory.post(path, data, format="json"))
+        force_authenticate(request, user=user)
+        return view(request, **kwargs)
+
+    analyst_list = call(analyst, "GET", plan_audit_imports.plan_summary_imports,
+                        "/api/v1/plan-audits/imports/")
+    assert analyst_list.status_code == 200
+    assert {item["id"] for item in analyst_list.data} == {accepted.pk, rejected.pk}
+    assert foreign.pk not in {item["id"] for item in analyst_list.data}
+    assert call(reviewer, "GET", plan_audit_imports.plan_summary_imports,
+                "/api/v1/plan-audits/imports/").status_code == 403
+    assert call(client_user, "GET", plan_audit_imports.plan_summary_imports,
+                "/api/v1/plan-audits/imports/").status_code == 403
+
+    from pricing.plan_audit_imports import create_plan_audit
+    accepted_response = call(analyst, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {
+        "organization_id": organization.pk, "plan_id": plan.pk,
+        "summary_import_id": accepted.pk, "audit_name": "Accepted synthetic audit",
+    })
+    assert accepted_response.status_code == 201, accepted_response.data
+    created = PlanAudit.objects.get(pk=accepted_response.data["id"])
+    assert created.summary_import_id == accepted.pk
+
+    for bad_import in (rejected, foreign):
+        response = call(analyst, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {
+            "organization_id": organization.pk, "plan_id": plan.pk,
+            "summary_import_id": bad_import.pk, "audit_name": "Invalid synthetic audit",
+        })
+        assert response.status_code == 400
+
+    assert call(reviewer, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {}).status_code == 403
+    assert call(client_user, "POST", create_plan_audit, "/api/v1/plan-audits/create/", {}).status_code == 403
+
+
+@pytest.mark.django_db
+def test_mk25_paginated_serializers_check_client_visibility_once(client, monkeypatch):
+    from types import SimpleNamespace
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    from pricing.permissions import APPLICATION_ROLES
+    from pricing import plan_audit_run
+
+    class Rows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def exclude(self, **kwargs):
+            return self
+
+        def order_by(self, *fields):
+            return self
+
+        def count(self):
+            return len(self.rows)
+
+        def __getitem__(self, item):
+            return self.rows[item]
+
+    factory = APIRequestFactory()
+    audit = SimpleNamespace(pk=1)
+    monkeypatch.setattr(plan_audit_run, "get_visible_audit", lambda user, audit_id: audit)
+    monkeypatch.setattr(plan_audit_run, "current_audit_run", lambda _audit: object())
+    monkeypatch.setattr(plan_audit_run, "run_results", lambda _run: active_rows[0])
+
+    for role in APPLICATION_ROLES:
+        user = get_user_model().objects.create_user(
+            username=f"mk25-{role.lower()}", password="test-only-password")
+        user.groups.add(Group.objects.get_or_create(name=role)[0])
+        client_only = role == "CLIENT"
+        checks = []
+        monkeypatch.setattr(plan_audit_run, "is_client_only",
+                            lambda _user, value=client_only: checks.append(value) or value)
+        for endpoint, route_name, values in (
+            (plan_audit_run.hospital_comparison, "hospital-comparison", {
+                "hospital_price_per_unit": "12", "hospital_markup_multiple": "2",
+                "plan_to_hospital_price_multiple": "1.5",
+            }),
+            (plan_audit_run.asp_benchmark, "asp-benchmark", {
+                "asp_payment_limit": "6", "allowed_markup_multiple": "2",
+                "paid_markup_multiple": "1.5",
+            }),
+        ):
+            query_counts = []
+            for size in (1, 50):
+                checks.clear()
+                row = SimpleNamespace(
+                    hcpcs_code="J1234", site_npi="1000000001", quarter="2026Q1",
+                    service_setting="outpatient", plan_allowed_price_per_unit="12",
+                    plan_paid_price_per_unit="9", data_quality_status="VALID",
+                    source_references={"private": "synthetic"}, **values)
+                active_rows = [Rows([row] * size)]
+                request = factory.get(f"/api/v1/plan-audits/1/{route_name}/")
+                force_authenticate(request, user=user)
+                with CaptureQueriesContext(connection) as queries:
+                    response = endpoint(request, audit_id=1)
+                query_counts.append(len(queries))
+                assert response.status_code == 200, (role, endpoint.__name__, response.data)
+                assert len(checks) == 1
+                result = response.data["results"][0]
+                assert ("source_references" in result) is (not client_only)
+            assert query_counts[0] == query_counts[1]
+
+
+@pytest.mark.django_db
+def test_mk28_client_market_exports_are_limited_to_released_canonical_csv(client, monkeypatch):
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+    from rest_framework.test import APIRequestFactory
+    from pricing.permissions import APPLICATION_ROLES, CanAdminister
+    from pricing import views
+
+    release = {"drug_codes": ["J1234"]}
+    monkeypatch.setattr(views, "_comparison_column_names", lambda: set(views.RATE_COLUMNS))
+    factory = APIRequestFactory()
+
+    for role in APPLICATION_ROLES:
+        user = get_user_model().objects.create_user(
+            username=f"mk28-{role.lower()}", password="test-only-password")
+        user.groups.add(Group.objects.get_or_create(name=role)[0])
+        monkeypatch.setattr(views, "_viewer_release_payload",
+                            lambda _request, client=(role == "CLIENT"):
+                            (release, None) if client else (None, None))
+
+        def authorized(path):
+            request = factory.get(path)
+            request.user = user
+            return views._authorized_rate_filters(request)[3]
+
+        legacy = authorized("/api/v1/comparisons.csv")
+        modern = authorized("/api/v1/hospital-drug-price-comparisons/exports/csv/")
+        if role == "CLIENT":
+            assert legacy.status_code == 403
+            assert isinstance(modern, list)
+            assert not {"source_file", "source_member", "source_sha256"}.intersection(modern)
+        else:
+            assert isinstance(legacy, list)
+            assert isinstance(modern, list)
+
+        xlsx_request = factory.get("/api/v1/hospital-drug-price-comparisons/exports/excel/")
+        xlsx_request.user = user
+        assert CanAdminister().has_permission(xlsx_request, None) is (role == "SUPER_ADMIN")
+
+
+@pytest.mark.django_db
 def test_viewer_login_requires_totp_enrollment_and_second_factor(client):
     from django.contrib.auth import get_user_model
     from django.contrib.auth.models import Group

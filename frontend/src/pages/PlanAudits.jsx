@@ -1136,6 +1136,7 @@ function PlanSetupSection({
   error, setError, setErrorDetails, setNotice, setBusy,
 }) {
   const assignedUserIds = new Set(accessRows.map((row) => String(row.user_id)));
+  const acceptedImports = imports.filter((item) => item.import_status === "accepted");
   const assignableUsers = viewerUsers.filter((item) => !assignedUserIds.has(String(item.id)));
   const roleLabels = { ANALYST: "Analyst", REVIEWER: "Reviewer", CLIENT: "Client", Viewer: "Legacy Viewer" };
   async function act(action, success) {
@@ -1368,7 +1369,7 @@ function PlanSetupSection({
                 const item = await postJSON("plan-audits/create/", {
                   organization_id: organizationId,
                   plan_id: planId,
-                  summary_import_id: form.get("summary_import_id") || importId,
+                  summary_import_id: form.get("summary_import_id") || selectedImport?.id || importId,
                   audit_name: form.get("audit_name"),
                   reporting_period: form.get("reporting_period"),
                 });
@@ -1377,7 +1378,7 @@ function PlanSetupSection({
               }, "Plan audit created.");
             }}
           >
-            {imports.length > 1 && (
+            {acceptedImports.length > 1 && (
               <label className="plan-audit-field">
                 Summary import
                 <select
@@ -1386,7 +1387,7 @@ function PlanSetupSection({
                   onChange={(e) => setImportId(e.target.value)}
                   required
                 >
-                  {imports.map((item) => (
+                  {acceptedImports.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.source_file_name} ({item.source_period || "no period"}; {item.import_status})
                     </option>
@@ -1396,6 +1397,7 @@ function PlanSetupSection({
             )}
             <Field name="audit_name" label="Audit name" maxLength="200" required />
             <Field
+              key={selectedImport.id}
               name="reporting_period"
               label="Source period"
               defaultValue={selectedImport.source_period}
@@ -1656,13 +1658,14 @@ export default function PlanAudits({ user }) {
     if (!planId) { setImports([]); setImportId(""); setAudits([]); setAuditId(""); return undefined; }
     let alive = true;
     Promise.all([
-      getJSON("plan-audits/imports/", { plan_id: planId }),
+      analyst ? getJSON("plan-audits/imports/", { plan_id: planId }) : Promise.resolve([]),
       getJSON("plan-audits/", { plan_id: planId }),
     ]).then(([importItems, auditItems]) => {
       if (!alive) return;
       setImports(importItems); setAudits(auditItems);
-      if (!importItems.some((item) => String(item.id) === String(importId))) {
-        const preferred = importItems.find((item) => item.import_status === "accepted") || importItems[0];
+      const selectableImports = importItems.filter((item) => item.import_status === "accepted");
+      if (!selectableImports.some((item) => String(item.id) === String(importId))) {
+        const preferred = selectableImports[0];
         setImportId(preferred ? String(preferred.id) : "");
       }
       if (!auditItems.some((item) => String(item.id) === String(auditId))) {
@@ -1723,9 +1726,14 @@ export default function PlanAudits({ user }) {
     return () => { alive = false; };
   }, [admin, organizationId, refreshKey]);
 
+  const acceptedImports = useMemo(
+    () => imports.filter((item) => item.import_status === "accepted"),
+    [imports]
+  );
   const selectedImport = useMemo(
-    () => imports.find((item) => String(item.id) === String(importId)),
-    [imports, importId]
+    () => acceptedImports.find((item) => String(item.id) === String(importId)) ||
+      (!importId ? acceptedImports[0] : null),
+    [acceptedImports, importId]
   );
 
   // Load network evidence

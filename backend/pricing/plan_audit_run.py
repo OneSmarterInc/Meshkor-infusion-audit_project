@@ -467,6 +467,7 @@ def _paged_audit_response(request, queryset, serialize, *, default_limit=200, ma
 @permission_classes([CanView])
 def hospital_comparison(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
+    client_only = is_client_only(request.user)
     rows = (
         run_results(current_audit_run(audit))
         .exclude(hospital_price_per_unit__isnull=True)
@@ -497,7 +498,7 @@ def hospital_comparison(request, audit_id):
                 "not the employer plan's contracted rate."
             ),
         }
-        if not is_client_only(request.user):
+        if not client_only:
             result["source_references"] = row.source_references
         return result
 
@@ -508,6 +509,7 @@ def hospital_comparison(request, audit_id):
 @permission_classes([CanView])
 def asp_benchmark(request, audit_id):
     audit = get_visible_audit(request.user, audit_id)
+    client_only = is_client_only(request.user)
     rows = run_results(current_audit_run(audit)).order_by(
         "hcpcs_code", "quarter", "site_npi",
         "service_setting", "pk"
@@ -535,7 +537,7 @@ def asp_benchmark(request, audit_id):
             ),
             "data_quality_status": row.data_quality_status,
         }
-        if not is_client_only(request.user):
+        if not client_only:
             result["source_references"] = row.source_references
         return result
 
